@@ -14,7 +14,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 WEBAPP_URL = os.environ.get("WEBAPP_URL", "https://kslmvv.github.io/bos-course/")
 SUPER_ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 PORT = int(os.environ.get("PORT", "8080"))
-USERS_FILE = "/tmp/allowed_users.json"
+USERS_FILE = "/data/allowed_users.json"
 
 def load_data():
     try:
