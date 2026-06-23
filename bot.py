@@ -1,397 +1,526 @@
-import os
+import asyncio
 import json
 import logging
-import asyncio
-from datetime import datetime
-from aiohttp import web
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-logging.basicConfig(level=logging.INFO)
+from aiohttp import web
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+
+import auth
+import db
+from config import ADMIN_ID, BOT_TOKEN, PORT, WEBAPP_ORIGIN, WEBAPP_URL
+from course_data import COURSE_DATA
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-WEBAPP_URL = os.environ.get("WEBAPP_URL", "https://kslmvv.github.io/bos-course/")
-SUPER_ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
-PORT = int(os.environ.get("PORT", "8080"))
-USERS_FILE = "/data/allowed_users.json"
+# httpx logs the full request URL at INFO level, which includes BOT_TOKEN for
+# every call to the Telegram API (.../bot<TOKEN>/getMe etc.) — keep it at WARNING
+# so the token never ends up in plaintext logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
-def load_data():
-    try:
-        if os.path.exists(USERS_FILE):
-            with open(USERS_FILE, "r") as f:
-                return json.load(f)
-    except Exception as e:
-        logger.error(f"Ошибка загрузки: {e}")
-    return {"phones": [], "telegram_ids": [], "admins": [], "admin_phones": [], "stats": {}}
 
-def save_data(data):
-    try:
-        with open(USERS_FILE, "w") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.error(f"Ошибка сохранения: {e}")
+# ─── Helpers ────────────────────────────────────────────────────────────
 
-def clean_phone(raw):
-    return raw.replace(" ", "").replace("-", "").lstrip("+")
 
-def is_phone(raw):
-    c = clean_phone(raw)
-    return c.isdigit() and len(c) >= 7 and (raw.strip().startswith("+") or len(c) > 10)
+def clean_phone(value) -> str:
+    return "".join(c for c in str(value) if c.isdigit())
 
-def is_super_admin(uid): return SUPER_ADMIN_ID != 0 and uid == SUPER_ADMIN_ID
-def is_admin(uid):
-    if is_super_admin(uid): return True
-    return uid in load_data().get("admins", [])
-def is_admin_phone(phone):
-    clean = clean_phone(phone)
-    return clean in [clean_phone(p) for p in load_data().get("admin_phones", [])]
-def is_allowed(uid, phone=None):
-    if is_admin(uid): return True
-    data = load_data()
-    if uid in data.get("telegram_ids", []): return True
-    if phone:
-        c = clean_phone(phone)
-        if c in [clean_phone(p) for p in data.get("phones", [])]: return True
-        if c in [clean_phone(p) for p in data.get("admin_phones", [])]: return True
-    return False
 
-def parse_arg(context):
-    if not context.args: return None
-    return "".join(context.args).strip()
+def is_phone(arg: str) -> bool:
+    return len(clean_phone(arg)) >= 9
 
-# ── HTTP API для статистики ───────────────────────────
-async def handle_track(request):
-    """WebApp отправляет просмотр сюда"""
-    try:
-        # CORS headers
-        headers = {
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'POST, OPTIONS',
-            'Access-Control-Allow-Headers': 'Content-Type',
-        }
-        if request.method == 'OPTIONS':
-            return web.Response(status=200, headers=headers)
 
-        body = await request.json()
-        uid = str(body.get("uid", ""))
-        entry = body.get("entry", "")
-        phone = body.get("phone", uid)
-        date = body.get("date", datetime.now().strftime("%d.%m.%Y"))
+def parse_arg(args) -> str:
+    return "".join(args).strip()
 
-        if not uid or not entry:
-            return web.json_response({"ok": False, "error": "missing uid or entry"}, headers=headers)
 
-        data = load_data()
-        if "stats" not in data: data["stats"] = {}
-        if uid not in data["stats"]:
-            data["stats"][uid] = {"watched": [], "phone": phone, "last_title": "", "last_date": ""}
+async def is_admin(telegram_id: int) -> bool:
+    if telegram_id == ADMIN_ID:
+        return True
+    return await db.is_user_admin(telegram_id)
 
-        user_stat = data["stats"][uid]
-        user_stat["phone"] = phone
-        if entry not in user_stat["watched"]:
-            user_stat["watched"].append(entry)
-        user_stat["last_title"] = entry
-        user_stat["last_date"] = date
-        data["stats"][uid] = user_stat
-        save_data(data)
-        logger.info(f"Tracked: uid={uid}, entry={entry}")
-        return web.json_response({"ok": True, "total": len(user_stat["watched"])}, headers=headers)
-    except Exception as e:
-        logger.error(f"handle_track error: {e}")
-        return web.json_response({"ok": False, "error": str(e)}, headers={'Access-Control-Allow-Origin': '*'})
 
-async def handle_health(request):
-    return web.json_response({"ok": True, "status": "running"})
+async def is_allowed(telegram_id: int) -> bool:
+    if await is_admin(telegram_id):
+        return True
+    return await db.is_user_allowed(telegram_id)
 
-# ── ТЕКСТЫ ────────────────────────────────────────────
-WELCOME_TEXT = """\
-🎓 *Добро пожаловать!*
 
-━━━━━━━━━━━━━━━━━━━━━━
-📚 *Курс «Бизнес Операционная Система»*
-👤 *Автор:* Александр Высоцкий
-━━━━━━━━━━━━━━━━━━━━━━
+# ─── Telegram handlers ──────────────────────────────────────────────────
 
-Этот курс поможет вам:
-✅ Выстроить систему управления бизнесом
-✅ Освободиться от операционки
-✅ Масштабировать компанию без хаоса
 
-Для получения доступа нажмите кнопку ниже 👇"""
-
-GRANTED_TEXT = """\
-✅ *Доступ открыт!*
-
-━━━━━━━━━━━━━━━━━━━━━━
-🎓 *Курс «Бизнес Операционная Система»*
-👤 *Александр Высоцкий*
-━━━━━━━━━━━━━━━━━━━━━━
-
-Нажмите кнопку ниже чтобы начать обучение 👇"""
-
-DENIED_TEXT = """\
-🔒 *Доступ закрыт*
-
-━━━━━━━━━━━━━━━━━━━━━━
-
-Ваш номер не найден в списке участников курса.
-
-Если это ошибка — обратитесь к организатору."""
-
-# ── ПОЛЬЗОВАТЕЛЬ ─────────────────────────────────────
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if is_allowed(uid):
-        await send_course_button(update)
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if await is_allowed(user_id):
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📚 Открыть курс", web_app={"url": WEBAPP_URL})]])
+        prefix = "администратор!" if await is_admin(user_id) else "участник!"
+        await update.message.reply_text(
+            f"✅ Добро пожаловать, {prefix}\n\nВаш доступ к курсу открыт.", reply_markup=kb
+        )
         return
-    keyboard = [[KeyboardButton("📱 Поделиться номером", request_contact=True)]]
+    kb = ReplyKeyboardMarkup(
+        [[KeyboardButton("📱 Поделиться номером", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
     await update.message.reply_text(
-        WELCOME_TEXT, parse_mode="Markdown",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+        "🎓 *Добро пожаловать!*\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "📚 Курс «Бизнес Операционная Система»\n"
+        "👤 Автор: Александр Высоцкий\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Этот курс поможет вам:\n"
+        "✅ Выстроить систему управления бизнесом\n"
+        "✅ Освободиться от операционки\n"
+        "✅ Масштабировать компанию без хаоса\n\n"
+        "Для получения доступа нажмите кнопку ниже 👇",
+        parse_mode="Markdown",
+        reply_markup=kb,
     )
 
-async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def contact_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     contact = update.message.contact
-    if not contact: return
-    phone = contact.phone_number
-    uid = update.effective_user.id
-    await update.message.reply_text("🔍 Проверяю доступ...", reply_markup=ReplyKeyboardRemove())
-    if is_allowed(uid, phone):
-        data = load_data()
-        if is_admin_phone(phone) and uid not in data.get("admins", []):
-            if "admins" not in data: data["admins"] = []
-            data["admins"].append(uid)
-        if uid not in data["telegram_ids"]:
-            data["telegram_ids"].append(uid)
-        save_data(data)
-        await send_course_button(update)
-    else:
-        await update.message.reply_text(DENIED_TEXT, parse_mode="Markdown")
+    user_id = update.effective_user.id
+    phone = f"+{clean_phone(contact.phone_number)}"
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📚 Открыть курс", web_app={"url": WEBAPP_URL})]])
 
-async def send_course_button(update: Update):
-    keyboard = [[InlineKeyboardButton("📚 Открыть курс", web_app=WebAppInfo(url=WEBAPP_URL))]]
+    allowed_phone = await db.get_allowed_phone(phone)
+    if allowed_phone:
+        await db.upsert_user(user_id, phone_number=phone, is_admin=allowed_phone["is_admin"], is_allowed=True)
+        if allowed_phone["is_admin"]:
+            await update.message.reply_text("✅ Вы вошли как администратор!", reply_markup=ReplyKeyboardRemove())
+        else:
+            await update.message.reply_text("✅ Доступ открыт!", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text("Нажмите чтобы начать:", reply_markup=kb)
+        return
+
+    existing = await db.get_user(user_id)
+    if existing and existing["is_allowed"]:
+        await db.upsert_user(user_id, phone_number=phone)
+        await update.message.reply_text("✅ Доступ открыт!", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text("Нажмите чтобы начать:", reply_markup=kb)
+        return
+
     await update.message.reply_text(
-        GRANTED_TEXT, parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        "🔒 Доступ закрыт.\n\nВаш номер не найден в списке участников.", reply_markup=ReplyKeyboardRemove()
     )
 
-# ── СТАТИСТИКА ────────────────────────────────────────
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+
+async def add_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if not await is_admin(user_id):
         await update.message.reply_text("❌ У вас нет прав администратора.")
         return
-    data = load_data()
-    stats = data.get("stats", {})
-    if not stats:
-        await update.message.reply_text("📊 *Статистика пока пуста*\n\nУчастники ещё не смотрели видео.", parse_mode="Markdown")
+    if not ctx.args:
+        await update.message.reply_text("Использование: /add +998XXXXXXXXX или /add 123456789")
         return
-    if context.args:
-        uid_str = "".join(context.args).strip().replace("+","")
-        user_stat = None
-        for key, val in stats.items():
-            if key == uid_str or clean_phone(val.get("phone","")) == uid_str:
-                user_stat = val; break
-        if not user_stat:
-            await update.message.reply_text("ℹ️ Пользователь не найден.")
+    arg = parse_arg(ctx.args)
+    if is_phone(arg):
+        phone = f"+{clean_phone(arg)}"
+        if await db.get_allowed_phone(phone):
+            await update.message.reply_text(f"⚠️ Номер {phone} уже в списке.")
             return
-        watched = user_stat.get("watched", [])
-        text = f"📊 *Статистика*\n\n📱 {user_stat.get('phone','—')}\n📚 Просмотрено: *{len(watched)} видео*\n📅 _{user_stat.get('last_title','—')}_\n🕐 {user_stat.get('last_date','—')}\n"
-        if watched:
-            text += "\n*Темы:*\n"
-            for w in watched[-15:]: text += f"  • {w}\n"
-            if len(watched) > 15: text += f"  _...и ещё {len(watched)-15}_\n"
-        await update.message.reply_text(text, parse_mode="Markdown")
+        await db.add_allowed_phone(phone, is_admin=False)
+        await db.set_allowed_by_phone(phone, True)
+        await update.message.reply_text(f"✅ Добавлен номер {phone}")
         return
-    total_views = sum(len(v.get("watched",[])) for v in stats.values())
-    text = f"📊 *Статистика просмотров*\n\n👥 Участников: *{len(stats)}*\n👁 Всего просмотров: *{total_views}*\n\n"
-    for uid, val in sorted(stats.items(), key=lambda x: len(x[1].get("watched",[])), reverse=True):
-        w = len(val.get("watched",[]))
-        bar = "█"*min(w,10) + "░"*max(0,10-w)
-        text += f"👤 *{val.get('phone',uid)}*\n   {bar} {w} видео | {val.get('last_date','—')}\n   _{val.get('last_title','—')}_\n\n"
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = str(update.effective_user.id)
-    data = load_data()
-    user_stat = data.get("stats", {}).get(uid)
-    if not user_stat or not user_stat.get("watched"):
-        await update.message.reply_text("📊 *Ваша статистика*\n\nПока пусто — откройте курс и посмотрите видео!", parse_mode="Markdown")
+    try:
+        tid = int(arg)
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат.")
         return
-    watched = user_stat.get("watched", [])
-    pct = int(len(watched)/77*100)
-    bar = "█"*int(pct/10) + "░"*(10-int(pct/10))
-    text = f"📊 *Ваша статистика*\n\n{bar} {pct}%\n📚 Просмотрено: *{len(watched)} из 77 видео*\n📅 Последнее: _{user_stat.get('last_title','—')}_\n🕐 {user_stat.get('last_date','—')}\n"
-    await update.message.reply_text(text, parse_mode="Markdown")
+    existing = await db.get_user(tid)
+    if existing and existing["is_allowed"]:
+        await update.message.reply_text(f"⚠️ ID {tid} уже в списке.")
+        return
+    await db.upsert_user(tid, is_allowed=True)
+    await update.message.reply_text(f"✅ Добавлен Telegram ID {tid}")
 
-# ── КОМАНДЫ АДМИНИСТРАТОРА ────────────────────────────
-async def add_user(update, context):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ У вас нет прав администратора."); return
-    arg = parse_arg(context)
-    if not arg:
-        await update.message.reply_text("Использование:\n/add +998901234567\n/add 123456789"); return
-    data = load_data()
+
+async def remove_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if not await is_admin(user_id):
+        await update.message.reply_text("❌ У вас нет прав администратора.")
+        return
+    if not ctx.args:
+        await update.message.reply_text("Использование: /remove +998XXXXXXXXX или /remove 123456789")
+        return
+    arg = parse_arg(ctx.args)
     if is_phone(arg):
-        c = clean_phone(arg)
-        if c not in data["phones"]:
-            data["phones"].append(c); save_data(data)
-            await update.message.reply_text(f"✅ Номер +{c} добавлен.")
-        else: await update.message.reply_text(f"ℹ️ Уже в списке.")
-    else:
-        c = clean_phone(arg)
-        if c.isdigit():
-            tid = int(c)
-            if tid not in data["telegram_ids"]:
-                data["telegram_ids"].append(tid); save_data(data)
-                await update.message.reply_text(f"✅ ID {tid} добавлен.")
-            else: await update.message.reply_text(f"ℹ️ Уже в списке.")
-        else: await update.message.reply_text("❌ Неверный формат.")
+        phone = f"+{clean_phone(arg)}"
+        removed_pre = await db.remove_allowed_phone(phone)
+        revoked = await db.set_allowed_by_phone(phone, False)
+        if removed_pre or revoked:
+            await update.message.reply_text(f"✅ Удалён номер {phone}")
+        else:
+            await update.message.reply_text("❌ Номер не найден.")
+        return
+    try:
+        tid = int(arg)
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат.")
+        return
+    existing = await db.get_user(tid)
+    if not existing or not existing["is_allowed"]:
+        await update.message.reply_text(f"❌ ID {tid} не найден.")
+        return
+    await db.upsert_user(tid, is_allowed=False)
+    await update.message.reply_text(f"✅ Удалён ID {tid}")
 
-async def remove_user(update, context):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ У вас нет прав."); return
-    arg = parse_arg(context)
-    if not arg:
-        await update.message.reply_text("Использование: /remove +998... или /remove 123..."); return
-    data = load_data()
+
+async def list_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if not await is_admin(user_id):
+        await update.message.reply_text("❌ У вас нет прав.")
+        return
+
+    users = await db.list_users()
+    allowed_phones = await db.list_allowed_phones()
+    registered_phones = {u["phone_number"] for u in users if u["phone_number"]}
+    pending_phones = [p for p in allowed_phones if p["phone_number"] not in registered_phones]
+
+    admins = [u for u in users if u["is_admin"]]
+    members = [u for u in users if u["is_allowed"] and not u["is_admin"]]
+
+    msg = f"👥 Участников: {len(members) + len(admins)}\n"
+    if members or admins:
+        msg += "\n🆔 Зарегистрированы:\n"
+        for u in members + admins:
+            label = u["phone_number"] or str(u["telegram_id"])
+            msg += f"  • {label} (ID {u['telegram_id']})\n"
+    if pending_phones:
+        msg += "\n📱 Ожидают регистрации:\n"
+        msg += "\n".join(f"  • {p['phone_number']}" for p in pending_phones) + "\n"
+    msg += f"\n🛠 Администраторов: {len(admins)}"
+    if admins:
+        msg += "\n" + "\n".join(
+            f"  • {a['phone_number'] or a['telegram_id']} (ID {a['telegram_id']})" for a in admins
+        )
+    await update.message.reply_text(msg)
+
+
+async def add_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("❌ Только супер-администратор может назначать администраторов.")
+        return
+    if not ctx.args:
+        await update.message.reply_text("Использование: /addadmin +998XXXXXXXXX или /addadmin 123456789")
+        return
+    arg = parse_arg(ctx.args)
     if is_phone(arg):
-        c = clean_phone(arg)
-        if c in data["phones"]: data["phones"].remove(c); save_data(data); await update.message.reply_text(f"✅ +{c} удалён.")
-        else: await update.message.reply_text(f"ℹ️ Не найден.")
-    else:
-        c = clean_phone(arg)
-        if c.isdigit():
-            tid = int(c)
-            if tid in data["telegram_ids"]: data["telegram_ids"].remove(tid); save_data(data); await update.message.reply_text(f"✅ ID {tid} удалён.")
-            else: await update.message.reply_text(f"ℹ️ Не найден.")
+        phone = f"+{clean_phone(arg)}"
+        existing = await db.get_allowed_phone(phone)
+        if existing and existing["is_admin"]:
+            await update.message.reply_text(f"⚠️ {phone} уже администратор.")
+            return
+        await db.add_allowed_phone(phone, is_admin=True)
+        await db.set_admin_by_phone(phone, True)
+        await update.message.reply_text(f"✅ Администратор добавлен: {phone}")
+        return
+    try:
+        tid = int(arg)
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат.")
+        return
+    existing = await db.get_user(tid)
+    if existing and existing["is_admin"]:
+        await update.message.reply_text(f"⚠️ ID {tid} уже администратор.")
+        return
+    await db.upsert_user(tid, is_admin=True, is_allowed=True)
+    await update.message.reply_text(f"✅ Администратор добавлен: ID {tid}")
 
-async def list_users(update, context):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ У вас нет прав."); return
-    data = load_data()
-    phones = data.get("phones", []); tids = data.get("telegram_ids", [])
-    admins = data.get("admins", []); admin_phones = data.get("admin_phones", [])
-    text = "📋 *Список доступа*\n\n"
-    text += f"📱 *Участники по номеру* ({len(phones)}):\n"
-    for p in phones: text += f"  +{p}\n"
-    text += f"\n🆔 *Участники по ID* ({len(tids)}):\n"
-    for t in tids: text += f"  {t}\n"
-    text += f"\n👑 *Администраторы* ({len(admins)+len(admin_phones)+1}):\n"
-    text += f"  {SUPER_ADMIN_ID} (главный)\n"
-    for a in admins: text += f"  {a}\n"
-    for p in admin_phones: text += f"  +{p} (по номеру)\n"
-    if not phones and not tids: text += "\n_Участников нет_"
-    await update.message.reply_text(text, parse_mode="Markdown")
 
-async def add_admin(update, context):
-    if not is_super_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Только главный администратор."); return
-    arg = parse_arg(context)
-    if not arg:
-        await update.message.reply_text("Использование:\n/addadmin +998...\n/addadmin 123..."); return
-    data = load_data()
-    if "admin_phones" not in data: data["admin_phones"] = []
-    if "admins" not in data: data["admins"] = []
+async def remove_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("❌ Только супер-администратор.")
+        return
+    if not ctx.args:
+        await update.message.reply_text("Использование: /removeadmin +998XXXXXXXXX или /removeadmin 123456789")
+        return
+    arg = parse_arg(ctx.args)
     if is_phone(arg):
-        c = clean_phone(arg)
-        if c not in data["admin_phones"]:
-            data["admin_phones"].append(c); save_data(data)
-            await update.message.reply_text(f"✅ Номер +{c} назначен администратором.")
-        else: await update.message.reply_text(f"ℹ️ Уже администратор.")
+        phone = f"+{clean_phone(arg)}"
+        existing = await db.get_allowed_phone(phone)
+        downgraded_pre = False
+        if existing and existing["is_admin"]:
+            await db.add_allowed_phone(phone, is_admin=False)
+            downgraded_pre = True
+        downgraded_user = await db.set_admin_by_phone(phone, False)
+        if downgraded_pre or downgraded_user:
+            await update.message.reply_text(f"✅ Снят: {phone}")
+        else:
+            await update.message.reply_text("❌ Не найден.")
+        return
+    try:
+        tid = int(arg)
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат.")
+        return
+    existing = await db.get_user(tid)
+    if not existing or not existing["is_admin"]:
+        await update.message.reply_text("❌ Не найден.")
+        return
+    await db.upsert_user(tid, is_admin=False)
+    await update.message.reply_text(f"✅ Снят: ID {tid}")
+
+
+async def stats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if not await is_admin(user_id):
+        await update.message.reply_text("❌ У вас нет прав.")
+        return
+
+    rows = await db.get_all_stats()
+    if not rows:
+        await update.message.reply_text(
+            "📊 Статистика пока пуста.\n\nДанные появятся после того как участники откроют видео."
+        )
+        return
+
+    by_user: dict[int, dict] = {}
+    for r in rows:
+        u = by_user.setdefault(r["telegram_id"], {"phone": r["phone_number"], "topics": [], "last": None})
+        u["topics"].append(r)
+        if u["last"] is None or r["updated_at"] > u["last"]["updated_at"]:
+            u["last"] = r
+
+    if ctx.args:
+        arg = parse_arg(ctx.args)
+        match = None
+        if is_phone(arg):
+            target_phone = f"+{clean_phone(arg)}"
+            for tid, u in by_user.items():
+                if u["phone"] == target_phone:
+                    match = (tid, u)
+                    break
+        if match is None and arg.lstrip("-").isdigit():
+            target_id = int(arg)
+            if target_id in by_user:
+                match = (target_id, by_user[target_id])
+        if not match:
+            await update.message.reply_text(f"❌ Нет данных для {arg}")
+            return
+
+        tid, u = match
+        label = u["phone"] or str(tid)
+        msg = (
+            f"📊 {label}\n\n"
+            f"📚 Просмотрено: {len(u['topics'])} тем\n"
+            f"🕐 {u['last']['updated_at'].strftime('%d.%m.%Y %H:%M')}\n"
+            f"Последнее: {u['last']['day']} — {u['last']['topic']}\n\nТемы:\n"
+        )
+        for t in u["topics"][-20:]:
+            msg += f"  ✅ {t['day']} — {t['topic']} ({t['progress']}с)\n"
+        await update.message.reply_text(msg)
+        return
+
+    msg = f"📊 Общая статистика\n👥 Пользователей: {len(by_user)}\n"
+    for tid, u in sorted(by_user.items(), key=lambda kv: len(kv[1]["topics"]), reverse=True):
+        label = u["phone"] or str(tid)
+        msg += "\n━━━━━━━━━━━━━━━━━\n"
+        msg += f"👤 {label}\n📚 Просмотрено: {len(u['topics'])} тем\n"
+        msg += f"🕐 Последний просмотр: {u['last']['updated_at'].strftime('%d.%m.%Y %H:%M')}\n\nТемы:\n"
+        for i, t in enumerate(u["topics"], 1):
+            msg += f"  {i}. {t['day']} — {t['topic']}\n"
+    if len(msg) > 4000:
+        msg = msg[:3900] + "\n..."
+    await update.message.reply_text(msg)
+
+
+async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if user_id == ADMIN_ID:
+        text = (
+            "🤖 Команды супер-администратора:\n\n"
+            "/add +998XXXXXXXXX — добавить участника\n"
+            "/remove +998XXXXXXXXX — удалить участника\n"
+            "/list — список всех участников\n"
+            "/addadmin +998XXXXXXXXX — назначить администратора\n"
+            "/removeadmin +998XXXXXXXXX — снять администратора\n"
+            "/stats — статистика просмотров\n"
+            "/stats +998XXXXXXXXX — статистика конкретного\n"
+            "/start — открыть курс"
+        )
+    elif await is_admin(user_id):
+        text = (
+            "🤖 Команды администратора:\n\n"
+            "/add +998XXXXXXXXX — добавить участника\n"
+            "/remove +998XXXXXXXXX — удалить участника\n"
+            "/list — список всех участников\n"
+            "/stats — статистика просмотров\n"
+            "/start — открыть курс"
+        )
     else:
-        c = clean_phone(arg)
-        if c.isdigit():
-            tid = int(c)
-            if tid not in data["admins"]:
-                data["admins"].append(tid); save_data(data)
-                await update.message.reply_text(f"✅ ID {tid} назначен администратором.")
-            else: await update.message.reply_text(f"ℹ️ Уже администратор.")
-        else: await update.message.reply_text("❌ Неверный формат.")
+        text = "/start — открыть курс"
+    await update.message.reply_text(text)
 
-async def remove_admin(update, context):
-    if not is_super_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Только главный администратор."); return
-    arg = parse_arg(context)
-    if not arg:
-        await update.message.reply_text("Использование: /removeadmin +998... или /removeadmin 123..."); return
-    data = load_data()
-    if is_phone(arg):
-        c = clean_phone(arg)
-        ap = data.get("admin_phones", [])
-        if c in ap: ap.remove(c); data["admin_phones"] = ap; save_data(data); await update.message.reply_text(f"✅ +{c} удалён из администраторов.")
-        else: await update.message.reply_text(f"ℹ️ Не найден.")
+
+async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log unhandled exceptions (e.g. a transient DB outage) and let the user
+    know, instead of silently dropping their message."""
+    logger.error("Unhandled exception while processing update %s", update, exc_info=ctx.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text("⚠️ Временная ошибка сервера. Попробуйте ещё раз позже.")
+        except Exception:
+            pass
+
+
+# ─── HTTP API (aiohttp) ─────────────────────────────────────────────────
+
+
+@web.middleware
+async def cors_middleware(request: web.Request, handler):
+    if request.method == "OPTIONS":
+        response: web.StreamResponse = web.Response(status=204)
     else:
-        c = clean_phone(arg)
-        if c.isdigit():
-            tid = int(c)
-            if tid in data.get("admins",[]): data["admins"].remove(tid); save_data(data); await update.message.reply_text(f"✅ ID {tid} удалён.")
-            else: await update.message.reply_text(f"ℹ️ Не найден.")
+        try:
+            response = await handler(request)
+        except web.HTTPException as exc:
+            response = exc
+    response.headers["Access-Control-Allow-Origin"] = WEBAPP_ORIGIN
+    response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return response
 
-async def help_cmd(update, context):
-    uid = update.effective_user.id
-    if is_super_admin(uid):
-        text = ("👑 *Команды главного администратора:*\n\n"
-            "/add +998XXXXXXXXX — добавить участника\n/add 123456789 — по ID\n"
-            "/remove +998XXXXXXXXX — удалить\n/list — список\n"
-            "/addadmin +998XXXXXXXXX — назначить админа\n/removeadmin — снять\n"
-            "/stats — статистика всех\n/stats 123... — конкретного\n/start — курс\n")
-    elif is_admin(uid):
-        text = ("🛠 *Команды администратора:*\n\n"
-            "/add +998XXXXXXXXX — добавить\n/remove — удалить\n"
-            "/list — список\n/stats — статистика\n/start — курс\n")
-    else:
-        text = "📚 Напишите /start для доступа к курсу.\n/mystats — ваша статистика"
-    await update.message.reply_text(text, parse_mode="Markdown")
 
-# ── ЗАПУСК ────────────────────────────────────────────
-def main():
-    if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN не задан!")
+async def _authenticate(request: web.Request) -> dict:
+    """Validate the `Authorization: tma <initData>` header, return the Telegram user dict."""
+    try:
+        raw_init_data = auth.extract_init_data(request.headers.get("Authorization"))
+        data = auth.parse_init_data(raw_init_data, BOT_TOKEN)
+    except auth.InitDataError as exc:
+        raise web.HTTPUnauthorized(reason=str(exc))
+    return data["user"]
 
-    # Создаём приложение бота
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("add", add_user))
-    app.add_handler(CommandHandler("remove", remove_user))
-    app.add_handler(CommandHandler("list", list_users))
-    app.add_handler(CommandHandler("addadmin", add_admin))
-    app.add_handler(CommandHandler("removeadmin", remove_admin))
-    app.add_handler(CommandHandler("stats", stats_cmd))
-    app.add_handler(CommandHandler("mystats", mystats_cmd))
-    app.add_handler(MessageHandler(filters.CONTACT, contact_handler))
 
-    # Создаём HTTP сервер для приёма статистики от WebApp
-    http_app = web.Application()
-    http_app.router.add_post('/track', handle_track)
-    http_app.router.add_options('/track', handle_track)
-    http_app.router.add_get('/health', handle_health)
+async def _resolve_user_id(request: web.Request) -> int:
+    """Resolve the acting Telegram user ID via initData or a `?token=`
+    "Открыть в браузере" token (see handle_browser_token)."""
+    token = request.query.get("token")
+    if token:
+        row = await db.get_browser_token(token)
+        if not row:
+            raise web.HTTPUnauthorized(reason="invalid or expired token")
+        return row["telegram_id"]
+    user = await _authenticate(request)
+    return user["id"]
 
-    async def run_all():
-        # Запускаем HTTP сервер
-        runner = web.AppRunner(http_app)
-        await runner.setup()
-        site = web.TCPSite(runner, '0.0.0.0', PORT)
+
+async def handle_health(request: web.Request) -> web.Response:
+    return web.json_response({"status": "ok"})
+
+
+async def handle_course(request: web.Request) -> web.Response:
+    user_id = await _resolve_user_id(request)
+    if not await is_allowed(user_id):
+        raise web.HTTPForbidden(reason="access denied")
+    return web.json_response(COURSE_DATA)
+
+
+async def handle_browser_token(request: web.Request) -> web.Response:
+    """Issue a one-time token for the "Открыть в браузере" link (see handle_course)."""
+    user = await _authenticate(request)
+    if not await is_allowed(user["id"]):
+        raise web.HTTPForbidden(reason="access denied")
+
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        payload = {}
+
+    day = payload.get("day")
+    topic = payload.get("topic")
+    day = day.strip()[:200] if isinstance(day, str) and day.strip() else None
+    topic = topic.strip()[:300] if isinstance(topic, str) and topic.strip() else None
+
+    token = await db.create_browser_token(user["id"], day, topic)
+    return web.json_response({"token": token})
+
+
+async def handle_stats(request: web.Request) -> web.Response:
+    user_id = await _resolve_user_id(request)
+    if not await is_allowed(user_id):
+        raise web.HTTPForbidden(reason="access denied")
+
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        raise web.HTTPBadRequest(reason="invalid JSON body")
+
+    day = payload.get("day")
+    topic = payload.get("topic")
+    progress = payload.get("progress")
+    if not isinstance(day, str) or not isinstance(topic, str) or not isinstance(progress, (int, float)):
+        raise web.HTTPBadRequest(reason="day, topic and progress are required")
+    if not day.strip() or not topic.strip():
+        raise web.HTTPBadRequest(reason="day and topic must not be empty")
+
+    progress_seconds = max(0, min(int(progress), 100_000))
+
+    # Ensure a `users` row exists so the FK on `stats.user_id` is satisfied
+    # even for the super-admin, who may never have triggered an upsert before.
+    await db.upsert_user(user_id)
+    await db.record_stat(user_id, day.strip()[:200], topic.strip()[:300], progress_seconds)
+    return web.json_response({"ok": True})
+
+
+def build_web_app() -> web.Application:
+    app = web.Application(middlewares=[cors_middleware])
+    app.router.add_get("/health", handle_health)
+    app.router.add_get("/api/course", handle_course)
+    app.router.add_post("/api/stats", handle_stats)
+    app.router.add_post("/api/browser-token", handle_browser_token)
+    app.router.add_route("OPTIONS", "/{tail:.*}", lambda request: web.Response(status=204))
+    return app
+
+
+# ─── Main ─────────────────────────────────────────────────────────────
+
+
+async def main() -> None:
+    await db.init_pool()
+
+    application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("add", add_user))
+    application.add_handler(CommandHandler("remove", remove_user))
+    application.add_handler(CommandHandler("list", list_users))
+    application.add_handler(CommandHandler("addadmin", add_admin))
+    application.add_handler(CommandHandler("removeadmin", remove_admin))
+    application.add_handler(CommandHandler("stats", stats_cmd))
+    application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(MessageHandler(filters.CONTACT, contact_handler))
+    application.add_error_handler(error_handler)
+
+    runner = web.AppRunner(build_web_app())
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+
+    async with application:
+        await application.start()
+        await application.updater.start_polling(drop_pending_updates=True)
         await site.start()
-        logger.info(f"HTTP API запущен на порту {PORT}")
-
-        # Запускаем бота
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling(drop_pending_updates=True)
-        logger.info("Бот запущен!")
-
-        # Держим запущенным
+        logger.info(f"Бот запущен, API сервер слушает порт {PORT}")
         try:
             await asyncio.Event().wait()
         finally:
-            await app.updater.stop()
-            await app.stop()
-            await app.shutdown()
+            await application.updater.stop()
+            await application.stop()
             await runner.cleanup()
+            await db.close_pool()
 
-    asyncio.run(run_all())
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

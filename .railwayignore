@@ -1,0 +1,5 @@
+.env
+hls_output/
+bos-course/
+__pycache__/
+*.pyc

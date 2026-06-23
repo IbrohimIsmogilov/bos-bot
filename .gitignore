@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+hls_output/
+.fstest/
+.claude/settings.local.json
+bos-course/
