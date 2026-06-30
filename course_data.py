@@ -202,6 +202,35 @@ _RAW_DAYS = [
     },
 ]
 
+_RAW_ROADMAP = {
+    "id": "roadmap",
+    "title": "Дорожная карта: 12 шагов (live)",
+    "videoUrl": "https://youtu.be/S_9NgQgwXRM",
+    "topics": [
+        {"title": "Вступление — проблемы владельца и анонс вебинара", "start": 0},
+        {"title": "Об Александре Высоцком — миссия и опыт", "start": 329},
+        {"title": "Личный путь — история создания системного бизнеса", "start": 609},
+        {"title": "Обзор дорожной карты: 12 шагов к системному бизнесу", "start": 2139},
+        {"title": "Шаг 1 — Функциональная структура", "start": 2356},
+        {"title": "Шаг 2 — Система управления задачами", "start": 2768},
+        {"title": "Шаг 3 — Пульс команды", "start": 3217},
+        {"title": "Шаг 4 — Финансы под ключ", "start": 3548},
+        {"title": "Шаг 5 — Бизнес-модель и личный доход владельца", "start": 3898},
+        {"title": "Шаг 6 — Мотивация, бонусы и заработная плата", "start": 4219},
+        {"title": "Шаг 7 — Эффективная воронка найма", "start": 4768},
+        {"title": "Шаг 8 — Технология делегирования", "start": 5162},
+        {"title": "Шаг 9 — Метрики и дэшборд", "start": 5552},
+        {"title": "Шаг 10 — Оперативное планирование и координация", "start": 5925},
+        {"title": "Шаг 11 — Оцифровка бизнес-процессов", "start": 6266},
+        {"title": "Шаг 12 — Стратегия следующего уровня", "start": 6461},
+        {"title": "Кейс резидента: клиника Arzu Medical", "start": 6704},
+        {"title": "Программа Бизнес Бустер — флагманский продукт", "start": 7479},
+        {"title": "Как устроена программа в деталях", "start": 7938},
+        {"title": "Уровни поддержки резидентов", "start": 8281},
+        {"title": "QnA — ответы на вопросы участников", "start": 10384},
+    ],
+}
+
 _RAW_BONUSES = [
     {
         "id": "b1",
@@ -297,8 +326,21 @@ def _build_tools() -> list[dict]:
     return tools
 
 
+def _build_roadmap() -> dict:
+    raw = _RAW_ROADMAP
+    topics = _build_topics(raw["topics"])
+    _validate_chronology("Дорожная карта", topics)
+    return {
+        "id": raw["id"],
+        "title": raw["title"],
+        "videoId": _video_id(raw["videoUrl"]),
+        "topics": topics,
+    }
+
+
 COURSE_DATA = {
     "days": _build_days(),
     "bonuses": _build_bonuses(),
     "tools": _build_tools(),
+    "roadmap": _build_roadmap(),
 }
