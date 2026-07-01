@@ -347,10 +347,14 @@ def _build_bos_course() -> dict:
         "days": _build_days(),
         "bonuses": _build_bonuses(),
         "tools": _build_tools(),
-        "roadmap": _build_roadmap(),
     }
 
 
 COURSES: dict[str, dict] = {
     "bos": _build_bos_course(),
+    # A single video with timecoded topics (no days/bonuses/tools) — used to
+    # live nested inside "bos" as its "Дорожная карта" section before being
+    # split into its own course; see migrate_roadmap_access.py for the
+    # one-time access backfill for users who already had "bos".
+    "roadmap": _build_roadmap(),
 }

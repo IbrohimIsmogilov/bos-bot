@@ -46,6 +46,10 @@ INSERT INTO courses (id, title, subtitle, icon) VALUES
     ('bos', 'Бизнес Операционная Система', 'Александр Высоцкий', '📚')
 ON CONFLICT (id) DO NOTHING;
 
+INSERT INTO courses (id, title, subtitle, icon) VALUES
+    ('roadmap', 'Дорожная карта: 12 шагов (live)', '12 шагов системного бизнеса', 'roadmap_icon.png')
+ON CONFLICT (id) DO NOTHING;
+
 CREATE TABLE IF NOT EXISTS user_course_access (
     user_id    BIGINT NOT NULL REFERENCES users (telegram_id) ON DELETE CASCADE,
     course_id  TEXT NOT NULL REFERENCES courses (id) ON DELETE CASCADE,

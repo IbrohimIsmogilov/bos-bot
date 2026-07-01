@@ -34,6 +34,13 @@ INSERT INTO courses (id, title, subtitle, icon) VALUES
     ('bos', 'Бизнес Операционная Система', 'Александр Высоцкий', '📚')
 ON CONFLICT (id) DO NOTHING;
 
+-- `icon` here is a relative path (served alongside index.html on GitHub
+-- Pages) rather than an emoji — the frontend's course-card renderer treats
+-- any icon ending in an image extension as an <img>, emoji otherwise.
+INSERT INTO courses (id, title, subtitle, icon) VALUES
+    ('roadmap', 'Дорожная карта: 12 шагов (live)', '12 шагов системного бизнеса', 'roadmap_icon.png')
+ON CONFLICT (id) DO NOTHING;
+
 -- Per-user, per-course entitlements. A row here means the user can fetch
 -- that course's content via GET /api/course?course_id=...
 CREATE TABLE IF NOT EXISTS user_course_access (
