@@ -12,9 +12,13 @@ import asyncio
 import os
 
 import asyncpg
-from dotenv import load_dotenv
 
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass  # not needed when env vars are already injected (e.g. `railway run`)
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 COURSE_ID = "bos"
