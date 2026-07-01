@@ -434,12 +434,45 @@ async def get_user_stats(user_id: int) -> list[asyncpg.Record]:
 async def get_all_stats() -> list[asyncpg.Record]:
     return await _get_pool().fetch(
         """
-        SELECT u.telegram_id, u.phone_number, s.day, s.topic, s.progress, s.updated_at
+        SELECT u.telegram_id, u.username, u.phone_number, s.day, s.topic, s.progress, s.updated_at
         FROM stats s
         JOIN users u ON u.telegram_id = s.user_id
         ORDER BY u.telegram_id, s.updated_at
         """
     )
+
+
+async def get_admin_stats_summary() -> dict:
+    """Raw data behind the admin panel's Статистика screen.
+
+    Reuses get_all_stats() for both the recent-activity feed and the
+    per-course engagement classification, rather than re-querying
+    stats+users with a near-duplicate join. Classifying which course each
+    row's `day` badge belongs to (and each topic's duration, for a
+    percent-watched estimate) needs course_data.py's COURSES registry,
+    which this module doesn't import — that part happens in bot.py.
+    """
+    pool = _get_pool()
+    total_users = await pool.fetchval("SELECT count(*) FROM users")
+    users_with_progress = await pool.fetchval("SELECT count(DISTINCT user_id) FROM stats")
+    access_counts = await pool.fetch(
+        """
+        SELECT c.id AS course_id, c.title, count(uca.user_id) AS access_count
+        FROM courses c
+        LEFT JOIN user_course_access uca ON uca.course_id = c.id
+        GROUP BY c.id, c.title
+        ORDER BY c.id
+        """
+    )
+    course_access = await pool.fetch("SELECT user_id, course_id FROM user_course_access")
+    all_stats = await get_all_stats()
+    return {
+        "total_users": total_users,
+        "users_with_progress": users_with_progress,
+        "access_counts": access_counts,
+        "course_access": course_access,
+        "all_stats": all_stats,
+    }
 
 
 # ─── Browser tokens ("Открыть в браузере") ─────────────────────────────

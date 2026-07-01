@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import json
 import logging
+import re
 
 import asyncpg
 from aiohttp import web
@@ -68,10 +69,11 @@ async def is_allowed(telegram_id: int) -> bool:
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     if await is_allowed(user_id):
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📚 Открыть курс", web_app={"url": WEBAPP_URL})]])
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📚 Мои курсы", web_app={"url": WEBAPP_URL})]])
         prefix = "администратор!" if await is_admin(user_id) else "участник!"
         await update.message.reply_text(
-            f"✅ Добро пожаловать, {prefix}\n\nВаш доступ к курсу открыт.", reply_markup=kb
+            f"✅ Добро пожаловать в BilimBook, {prefix}\n\nНажмите кнопку ниже, чтобы открыть ваши курсы.",
+            reply_markup=kb,
         )
         return
     kb = ReplyKeyboardMarkup(
@@ -80,7 +82,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         one_time_keyboard=True,
     )
     await update.message.reply_text(
-        "🎓 *Добро пожаловать!*\n\n"
+        "🎓 *Добро пожаловать в BilimBook!*\n\n"
+        "BilimBook — образовательная платформа с несколькими курсами для владельцев бизнеса.\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "📚 Курс «Бизнес Операционная Система»\n"
         "👤 Автор: Александр Высоцкий\n"
@@ -99,7 +102,7 @@ async def contact_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     contact = update.message.contact
     user_id = update.effective_user.id
     phone = f"+{clean_phone(contact.phone_number)}"
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📚 Открыть курс", web_app={"url": WEBAPP_URL})]])
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📚 Мои курсы", web_app={"url": WEBAPP_URL})]])
 
     allowed_phone = await db.get_allowed_phone(phone)
     if allowed_phone:
@@ -373,7 +376,7 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "/removeadmin +998XXXXXXXXX — снять администратора\n"
             "/stats — статистика просмотров\n"
             "/stats +998XXXXXXXXX — статистика конкретного\n"
-            "/start — открыть курс"
+            "/start — мои курсы"
         )
     elif await is_admin(user_id):
         text = (
@@ -382,10 +385,10 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "/remove +998XXXXXXXXX — удалить участника\n"
             "/list — список всех участников\n"
             "/stats — статистика просмотров\n"
-            "/start — открыть курс"
+            "/start — мои курсы"
         )
     else:
-        text = "/start — открыть курс"
+        text = "/start — мои курсы"
     await update.message.reply_text(text)
 
 
@@ -646,6 +649,121 @@ async def handle_admin_delete_user(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
+# `stats.day`/`stats.topic` are free-text badges (see reportStats() in
+# main.js), not a course_id — this maps them back to a course + topic list
+# so the admin stats screen can classify historical rows and estimate a
+# percent-watched from each topic's known duration in course_data.py.
+def _build_badge_lookup() -> dict:
+    lookup = {}
+    bos = COURSES.get("bos", {})
+    for day in bos.get("days", []):
+        lookup["ДЕНЬ " + str(day["id"])] = ("bos", day["topics"])
+    for i, bonus in enumerate(bos.get("bonuses", [])):
+        lookup["БОНУС " + str(i + 1)] = ("bos", bonus["topics"])
+    for tool in bos.get("tools", []):
+        if tool.get("topics"):
+            lookup[tool["title"].upper()] = ("bos", tool["topics"])
+    for course_id, data in COURSES.items():
+        if isinstance(data, dict) and "topics" in data and "videoId" in data:
+            lookup[data["title"].upper()] = (course_id, data["topics"])
+    # Backward-compat: stats recorded before "roadmap" became its own course
+    # used this fixed badge (see the old openRoadmap() in main.js) instead of
+    # the course's actual title.
+    if "roadmap" in COURSES:
+        lookup.setdefault("ДОРОЖНАЯ КАРТА", ("roadmap", COURSES["roadmap"]["topics"]))
+    return lookup
+
+
+_BADGE_LOOKUP = _build_badge_lookup()
+_TOPIC_IDX_RE = re.compile(r"^Тема (\d+):")
+
+
+def _classify_stat(day: str, topic: str, progress: int):
+    """Returns (course_id, percent) for a stats row. `course_id` is None if
+    the badge doesn't match any known course/section; `percent` is None if
+    the topic's total duration isn't known (e.g. its endSeconds is null)."""
+    entry = _BADGE_LOOKUP.get(day)
+    if not entry:
+        return None, None
+    course_id, topics = entry
+    m = _TOPIC_IDX_RE.match(topic or "")
+    if not m:
+        return course_id, None
+    idx = int(m.group(1)) - 1
+    if not (0 <= idx < len(topics)):
+        return course_id, None
+    tp = topics[idx]
+    start = tp.get("startSeconds") or 0
+    end = tp.get("endSeconds")
+    if end is None or end <= start:
+        return course_id, None
+    percent = max(0, min(100, round(progress / (end - start) * 100)))
+    return course_id, percent
+
+
+async def handle_admin_stats(request: web.Request) -> web.Response:
+    user = await _authenticate(request)
+    _require_admin(user["id"])
+
+    raw = await db.get_admin_stats_summary()
+
+    access_counts = [_row_to_dict(r) for r in raw["access_counts"]]
+    access_users_by_course: dict = {}
+    for r in raw["course_access"]:
+        access_users_by_course.setdefault(r["course_id"], set()).add(r["user_id"])
+
+    watched_users_by_course: dict = {}
+    decorated = []
+    for r in raw["all_stats"]:
+        course_id, percent = _classify_stat(r["day"], r["topic"], r["progress"])
+        if course_id:
+            watched_users_by_course.setdefault(course_id, set()).add(r["telegram_id"])
+        decorated.append(
+            {
+                "user_id": r["telegram_id"],
+                "username": r["username"],
+                "phone_number": r["phone_number"],
+                "course_id": course_id,
+                "day": r["day"],
+                "topic": r["topic"],
+                "progress_seconds": r["progress"],
+                "percent": percent,
+                "updated_at": r["updated_at"].isoformat(),
+                "_updated_at_sort": r["updated_at"],
+            }
+        )
+
+    course_engagement = []
+    for c in access_counts:
+        cid = c["course_id"]
+        total = c["access_count"]
+        watched = len(watched_users_by_course.get(cid, set()) & access_users_by_course.get(cid, set()))
+        course_engagement.append(
+            {
+                "course_id": cid,
+                "title": c["title"],
+                "watched": watched,
+                "total": total,
+                "percent": round(watched / total * 100) if total else 0,
+            }
+        )
+
+    decorated.sort(key=lambda r: r["_updated_at_sort"], reverse=True)
+    recent_activity = [{k: v for k, v in r.items() if k != "_updated_at_sort"} for r in decorated[:20]]
+
+    return web.json_response(
+        {
+            "overview": {
+                "total_users": raw["total_users"],
+                "users_with_progress": raw["users_with_progress"],
+                "access_counts": access_counts,
+            },
+            "course_engagement": course_engagement,
+            "recent_activity": recent_activity,
+        }
+    )
+
+
 def build_web_app() -> web.Application:
     app = web.Application(middlewares=[cors_middleware])
     app.router.add_get("/health", handle_health)
@@ -658,6 +776,7 @@ def build_web_app() -> web.Application:
     app.router.add_post("/api/admin/add-user-by-id", handle_admin_add_user_by_id)
     app.router.add_post("/api/admin/add-user-by-phone", handle_admin_add_user_by_phone)
     app.router.add_post("/api/admin/delete-user", handle_admin_delete_user)
+    app.router.add_get("/api/admin/stats", handle_admin_stats)
     app.router.add_route("OPTIONS", "/{tail:.*}", lambda request: web.Response(status=204))
     return app
 
