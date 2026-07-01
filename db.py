@@ -62,6 +62,12 @@ CREATE TABLE IF NOT EXISTS allowed_phones (
     added_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS allowed_phone_course_access (
+    phone_number TEXT NOT NULL REFERENCES allowed_phones (phone_number) ON DELETE CASCADE,
+    course_id    TEXT NOT NULL REFERENCES courses (id) ON DELETE CASCADE,
+    PRIMARY KEY (phone_number, course_id)
+);
+
 CREATE TABLE IF NOT EXISTS stats (
     id         BIGSERIAL PRIMARY KEY,
     user_id    BIGINT NOT NULL REFERENCES users (telegram_id) ON DELETE CASCADE,
@@ -182,6 +188,37 @@ async def revoke_user(telegram_id: int) -> bool:
         telegram_id,
     )
     return result != "UPDATE 0"
+
+
+async def delete_user(telegram_id: int) -> dict:
+    """Permanently delete a user and all their data.
+
+    Deleting the `users` row alone is enough: `user_course_access.user_id`,
+    `stats.user_id` and `browser_tokens.telegram_id` all have ON DELETE
+    CASCADE back to `users.telegram_id` (see schema.sql), and Postgres
+    applies those cascades atomically as part of this single DELETE.
+    Wrapped in an explicit transaction anyway so the pre-delete counts
+    (used to report what was removed) are consistent with what actually
+    gets deleted, even under concurrent access.
+    """
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            stats_count = await conn.fetchval("SELECT count(*) FROM stats WHERE user_id = $1", telegram_id)
+            course_count = await conn.fetchval(
+                "SELECT count(*) FROM user_course_access WHERE user_id = $1", telegram_id
+            )
+            token_count = await conn.fetchval(
+                "SELECT count(*) FROM browser_tokens WHERE telegram_id = $1", telegram_id
+            )
+            result = await conn.execute("DELETE FROM users WHERE telegram_id = $1", telegram_id)
+            deleted = result != "DELETE 0"
+            return {
+                "deleted": deleted,
+                "stats_deleted": stats_count if deleted else 0,
+                "course_access_deleted": course_count if deleted else 0,
+                "browser_tokens_deleted": token_count if deleted else 0,
+            }
 
 
 async def set_admin_by_phone(phone_number: str, is_admin: bool) -> bool:
@@ -332,6 +369,29 @@ async def get_allowed_phone(phone_number: str) -> Optional[asyncpg.Record]:
 
 async def list_allowed_phones() -> list[asyncpg.Record]:
     return await _get_pool().fetch("SELECT * FROM allowed_phones ORDER BY added_at")
+
+
+async def add_allowed_phone_course_access(phone_number: str, course_id: str) -> None:
+    """Remember that `course_id` should be granted once this (not-yet-
+    registered) phone number's owner first messages the bot — see
+    contact_handler, which reads this back via get_allowed_phone_course_ids."""
+    await _get_pool().execute(
+        """
+        INSERT INTO allowed_phone_course_access (phone_number, course_id)
+        VALUES ($1, $2)
+        ON CONFLICT (phone_number, course_id) DO NOTHING
+        """,
+        phone_number,
+        course_id,
+    )
+
+
+async def get_allowed_phone_course_ids(phone_number: str) -> list[str]:
+    rows = await _get_pool().fetch(
+        "SELECT course_id FROM allowed_phone_course_access WHERE phone_number = $1",
+        phone_number,
+    )
+    return [r["course_id"] for r in rows]
 
 
 # ─── Stats ──────────────────────────────────────────────────────────────

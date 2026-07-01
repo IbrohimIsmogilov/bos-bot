@@ -54,6 +54,17 @@ CREATE TABLE IF NOT EXISTS allowed_phones (
     added_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Courses an admin pre-selected for a not-yet-registered phone number (see
+-- POST /api/admin/add-user-by-phone). Applied to user_course_access once the
+-- phone's owner actually messages the bot and shares their contact
+-- (contact_handler); falls back to DEFAULT_COURSE_ID if empty, matching the
+-- pre-multi-course behavior of a plain /add <phone>.
+CREATE TABLE IF NOT EXISTS allowed_phone_course_access (
+    phone_number TEXT NOT NULL REFERENCES allowed_phones (phone_number) ON DELETE CASCADE,
+    course_id    TEXT NOT NULL REFERENCES courses (id) ON DELETE CASCADE,
+    PRIMARY KEY (phone_number, course_id)
+);
+
 -- Статистика просмотров. Прогресс по теме сохраняется как максимум
 -- (GREATEST) между текущим и новым значением — апсерт атомарен и
 -- не подвержен Race Condition при параллельных запросах.

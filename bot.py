@@ -110,7 +110,9 @@ async def contact_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             is_admin=allowed_phone["is_admin"],
             is_allowed=True,
         )
-        await db.grant_course_access(user_id, DEFAULT_COURSE_ID, granted_by=None)
+        pending_courses = await db.get_allowed_phone_course_ids(phone)
+        for course_id in pending_courses or [DEFAULT_COURSE_ID]:
+            await db.grant_course_access(user_id, course_id, granted_by=None)
         if allowed_phone["is_admin"]:
             await update.message.reply_text("✅ Вы вошли как администратор!", reply_markup=ReplyKeyboardRemove())
         else:
@@ -562,6 +564,88 @@ async def handle_admin_grant_access(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+async def _validate_course_ids(course_ids) -> list:
+    """Validate an optional `course_ids` request field: must be a list of
+    strings, each naming a real course. Returns [] if omitted entirely."""
+    if course_ids is None:
+        return []
+    if not isinstance(course_ids, list) or not all(isinstance(c, str) for c in course_ids):
+        raise web.HTTPBadRequest(reason="course_ids must be a list of strings")
+    for course_id in course_ids:
+        if not await db.get_course(course_id):
+            raise web.HTTPNotFound(reason=f"unknown course_id: {course_id}")
+    return course_ids
+
+
+async def handle_admin_add_user_by_id(request: web.Request) -> web.Response:
+    admin_user = await _authenticate(request)
+    _require_admin(admin_user["id"])
+
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        raise web.HTTPBadRequest(reason="invalid JSON body")
+
+    target_user_id = payload.get("user_id")
+    if not isinstance(target_user_id, int):
+        raise web.HTTPBadRequest(reason="user_id (int) is required")
+    course_ids = await _validate_course_ids(payload.get("course_ids"))
+
+    await db.upsert_user(target_user_id, is_allowed=True)
+    for course_id in course_ids:
+        await db.grant_course_access(target_user_id, course_id, granted_by=admin_user["id"])
+    return web.json_response({"ok": True})
+
+
+async def handle_admin_add_user_by_phone(request: web.Request) -> web.Response:
+    admin_user = await _authenticate(request)
+    _require_admin(admin_user["id"])
+
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        raise web.HTTPBadRequest(reason="invalid JSON body")
+
+    raw_phone = payload.get("phone_number")
+    if not isinstance(raw_phone, str) or not is_phone(raw_phone):
+        raise web.HTTPBadRequest(reason="a valid phone_number is required")
+    course_ids = await _validate_course_ids(payload.get("course_ids"))
+
+    phone = f"+{clean_phone(raw_phone)}"
+    await db.add_allowed_phone(phone, is_admin=False)
+    await db.set_allowed_by_phone(phone, True)
+    for course_id in course_ids:
+        await db.add_allowed_phone_course_access(phone, course_id)
+
+    # If this phone already belongs to a registered user, grant immediately
+    # instead of only waiting on a future contact share (which may never
+    # come again for someone who's already been through that flow once).
+    existing = await db.get_user_by_phone(phone)
+    if existing:
+        for course_id in course_ids:
+            await db.grant_course_access(existing["telegram_id"], course_id, granted_by=admin_user["id"])
+    return web.json_response({"ok": True})
+
+
+async def handle_admin_delete_user(request: web.Request) -> web.Response:
+    admin_user = await _authenticate(request)
+    _require_admin(admin_user["id"])
+
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        raise web.HTTPBadRequest(reason="invalid JSON body")
+
+    target_user_id = payload.get("user_id")
+    if not isinstance(target_user_id, int):
+        raise web.HTTPBadRequest(reason="user_id (int) is required")
+
+    result = await db.delete_user(target_user_id)
+    if not result["deleted"]:
+        raise web.HTTPNotFound(reason="user not found")
+    return web.json_response(result)
+
+
 def build_web_app() -> web.Application:
     app = web.Application(middlewares=[cors_middleware])
     app.router.add_get("/health", handle_health)
@@ -571,6 +655,9 @@ def build_web_app() -> web.Application:
     app.router.add_post("/api/browser-token", handle_browser_token)
     app.router.add_get("/api/admin/users", handle_admin_users)
     app.router.add_post("/api/admin/grant-access", handle_admin_grant_access)
+    app.router.add_post("/api/admin/add-user-by-id", handle_admin_add_user_by_id)
+    app.router.add_post("/api/admin/add-user-by-phone", handle_admin_add_user_by_phone)
+    app.router.add_post("/api/admin/delete-user", handle_admin_delete_user)
     app.router.add_route("OPTIONS", "/{tail:.*}", lambda request: web.Response(status=204))
     return app
 
