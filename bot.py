@@ -1,7 +1,9 @@
 import asyncio
+import datetime
 import json
 import logging
 
+import asyncpg
 from aiohttp import web
 from telegram import (
     InlineKeyboardButton,
@@ -15,8 +17,14 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 import auth
 import db
-from config import ADMIN_ID, BOT_TOKEN, PORT, WEBAPP_ORIGIN, WEBAPP_URL
-from course_data import COURSE_DATA
+from config import ADMIN_ID, ADMIN_USER_IDS, BOT_TOKEN, PORT, WEBAPP_ORIGIN, WEBAPP_URL
+from course_data import COURSES
+
+# Course granted automatically to every approved bot member until the
+# frontend/bot flows are updated (Этап 2) to let admins pick per-course
+# access explicitly. Keeps /add, /remove and the contact flow working
+# unchanged for the only course that exists today.
+DEFAULT_COURSE_ID = "bos"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -95,7 +103,14 @@ async def contact_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 
     allowed_phone = await db.get_allowed_phone(phone)
     if allowed_phone:
-        await db.upsert_user(user_id, phone_number=phone, is_admin=allowed_phone["is_admin"], is_allowed=True)
+        await db.upsert_user(
+            user_id,
+            phone_number=phone,
+            username=update.effective_user.username,
+            is_admin=allowed_phone["is_admin"],
+            is_allowed=True,
+        )
+        await db.grant_course_access(user_id, DEFAULT_COURSE_ID, granted_by=None)
         if allowed_phone["is_admin"]:
             await update.message.reply_text("✅ Вы вошли как администратор!", reply_markup=ReplyKeyboardRemove())
         else:
@@ -105,7 +120,8 @@ async def contact_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 
     existing = await db.get_user(user_id)
     if existing and existing["is_allowed"]:
-        await db.upsert_user(user_id, phone_number=phone)
+        await db.upsert_user(user_id, phone_number=phone, username=update.effective_user.username)
+        await db.grant_course_access(user_id, DEFAULT_COURSE_ID, granted_by=None)
         await update.message.reply_text("✅ Доступ открыт!", reply_markup=ReplyKeyboardRemove())
         await update.message.reply_text("Нажмите чтобы начать:", reply_markup=kb)
         return
@@ -143,6 +159,7 @@ async def add_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"⚠️ ID {tid} уже в списке.")
         return
     await db.upsert_user(tid, is_allowed=True)
+    await db.grant_course_access(tid, DEFAULT_COURSE_ID, granted_by=user_id)
     await update.message.reply_text(f"✅ Добавлен Telegram ID {tid}")
 
 
@@ -157,8 +174,11 @@ async def remove_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     arg = parse_arg(ctx.args)
     if is_phone(arg):
         phone = f"+{clean_phone(arg)}"
+        registered = await db.get_user_by_phone(phone)
         removed_pre = await db.remove_allowed_phone(phone)
         revoked = await db.set_allowed_by_phone(phone, False)
+        if registered:
+            await db.revoke_course_access(registered["telegram_id"], DEFAULT_COURSE_ID)
         if removed_pre or revoked:
             await update.message.reply_text(f"✅ Удалён номер {phone}")
         else:
@@ -174,6 +194,7 @@ async def remove_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"❌ ID {tid} не найден.")
         return
     await db.upsert_user(tid, is_allowed=False)
+    await db.revoke_course_access(tid, DEFAULT_COURSE_ID)
     await update.message.reply_text(f"✅ Удалён ID {tid}")
 
 
@@ -418,15 +439,45 @@ async def _resolve_user_id(request: web.Request) -> int:
     return user["id"]
 
 
+async def _has_course_access(user_id: int, course_id: str) -> bool:
+    """Admins (bot-wide, via is_admin) can open any course; everyone else
+    needs an explicit user_course_access row for that course_id."""
+    if await is_admin(user_id):
+        return True
+    return await db.has_course_access(user_id, course_id)
+
+
+def _require_admin(user_id: int) -> None:
+    if user_id not in ADMIN_USER_IDS:
+        raise web.HTTPForbidden(reason="admin access required")
+
+
+def _row_to_dict(row: asyncpg.Record) -> dict:
+    return {k: (v.isoformat() if isinstance(v, datetime.datetime) else v) for k, v in dict(row).items()}
+
+
 async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
 
 
 async def handle_course(request: web.Request) -> web.Response:
+    # Defaults to the only course that exists today so the not-yet-updated
+    # frontend (Этап 2) keeps working unchanged during the transition.
     user_id = await _resolve_user_id(request)
-    if not await is_allowed(user_id):
+
+    course_id = request.query.get("course_id", DEFAULT_COURSE_ID)
+    if course_id not in COURSES:
+        raise web.HTTPNotFound(reason="unknown course_id")
+    if not await _has_course_access(user_id, course_id):
         raise web.HTTPForbidden(reason="access denied")
-    return web.json_response(COURSE_DATA)
+    return web.json_response(COURSES[course_id])
+
+
+async def handle_my_courses(request: web.Request) -> web.Response:
+    user = await _authenticate(request)
+    await db.upsert_user(user["id"], username=user.get("username"))
+    courses = await db.get_user_courses(user["id"])
+    return web.json_response([_row_to_dict(c) for c in courses])
 
 
 async def handle_browser_token(request: web.Request) -> web.Response:
@@ -476,12 +527,50 @@ async def handle_stats(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+# ─── Admin API (BilimBook admin panel) ──────────────────────────────────
+
+
+async def handle_admin_users(request: web.Request) -> web.Response:
+    user = await _authenticate(request)
+    _require_admin(user["id"])
+    rows = await db.list_all_users_with_access()
+    return web.json_response([_row_to_dict(r) for r in rows])
+
+
+async def handle_admin_grant_access(request: web.Request) -> web.Response:
+    admin_user = await _authenticate(request)
+    _require_admin(admin_user["id"])
+
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        raise web.HTTPBadRequest(reason="invalid JSON body")
+
+    target_user_id = payload.get("user_id")
+    course_id = payload.get("course_id")
+    grant = payload.get("grant")
+    if not isinstance(target_user_id, int) or not isinstance(course_id, str) or not isinstance(grant, bool):
+        raise web.HTTPBadRequest(reason="user_id (int), course_id (str) and grant (bool) are required")
+
+    if not await db.get_course(course_id):
+        raise web.HTTPNotFound(reason="unknown course_id")
+
+    if grant:
+        await db.grant_course_access(target_user_id, course_id, granted_by=admin_user["id"])
+    else:
+        await db.revoke_course_access(target_user_id, course_id)
+    return web.json_response({"ok": True})
+
+
 def build_web_app() -> web.Application:
     app = web.Application(middlewares=[cors_middleware])
     app.router.add_get("/health", handle_health)
     app.router.add_get("/api/course", handle_course)
+    app.router.add_get("/api/my-courses", handle_my_courses)
     app.router.add_post("/api/stats", handle_stats)
     app.router.add_post("/api/browser-token", handle_browser_token)
+    app.router.add_get("/api/admin/users", handle_admin_users)
+    app.router.add_post("/api/admin/grant-access", handle_admin_grant_access)
     app.router.add_route("OPTIONS", "/{tail:.*}", lambda request: web.Response(status=204))
     return app
 

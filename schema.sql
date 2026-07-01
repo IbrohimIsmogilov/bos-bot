@@ -7,12 +7,44 @@
 CREATE TABLE IF NOT EXISTS users (
     telegram_id  BIGINT PRIMARY KEY,
     phone_number TEXT,
+    username     TEXT,
     is_admin     BOOLEAN NOT NULL DEFAULT FALSE,
     is_allowed   BOOLEAN NOT NULL DEFAULT FALSE,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Safe to re-run against an already-deployed database: adds the column
+-- backing per-user Telegram @username display in the admin panel.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT;
+
 CREATE INDEX IF NOT EXISTS idx_users_phone_number ON users (phone_number);
+
+-- Registry of courses on the BilimBook platform. Course *content* (video
+-- IDs, timecodes) lives in course_data.py; this table only holds the
+-- metadata needed to list courses in the WebApp's course picker.
+CREATE TABLE IF NOT EXISTS courses (
+    id         TEXT PRIMARY KEY,
+    title      TEXT NOT NULL,
+    subtitle   TEXT,
+    icon       TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+INSERT INTO courses (id, title, subtitle, icon) VALUES
+    ('bos', 'Бизнес Операционная Система', 'Александр Высоцкий', '📚')
+ON CONFLICT (id) DO NOTHING;
+
+-- Per-user, per-course entitlements. A row here means the user can fetch
+-- that course's content via GET /api/course?course_id=...
+CREATE TABLE IF NOT EXISTS user_course_access (
+    user_id    BIGINT NOT NULL REFERENCES users (telegram_id) ON DELETE CASCADE,
+    course_id  TEXT NOT NULL REFERENCES courses (id) ON DELETE CASCADE,
+    granted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    granted_by BIGINT,
+    PRIMARY KEY (user_id, course_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_course_access_user_id ON user_course_access (user_id);
 
 -- Номера телефонов, заранее одобренные администратором до того, как
 -- пользователь впервые написал боту и поделился контактом.

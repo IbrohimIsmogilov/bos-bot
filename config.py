@@ -7,6 +7,12 @@ WEBAPP_URL = os.environ.get("WEBAPP_URL", "https://kslmvv.github.io/bos-course/"
 DATABASE_URL = os.environ["DATABASE_URL"]
 PORT = int(os.environ.get("PORT", "8080"))
 
+# Telegram user IDs allowed to call the /api/admin/* endpoints, as a
+# comma-separated list (e.g. "111111,222222"). Falls back to just ADMIN_ID
+# (the bot's super-admin) if unset.
+_admin_user_ids_raw = os.environ.get("ADMIN_USER_IDS", "")
+ADMIN_USER_IDS = {int(x) for x in _admin_user_ids_raw.split(",") if x.strip()} or {ADMIN_ID}
+
 # Origin (scheme + host) of the deployed WebApp, used to restrict CORS on the
 # HTTP API to the one frontend that's allowed to call it.
 _webapp_parsed = urlparse(WEBAPP_URL)

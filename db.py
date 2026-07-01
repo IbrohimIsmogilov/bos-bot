@@ -24,12 +24,37 @@ _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS users (
     telegram_id  BIGINT PRIMARY KEY,
     phone_number TEXT,
+    username     TEXT,
     is_admin     BOOLEAN NOT NULL DEFAULT FALSE,
     is_allowed   BOOLEAN NOT NULL DEFAULT FALSE,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT;
+
 CREATE INDEX IF NOT EXISTS idx_users_phone_number ON users (phone_number);
+
+CREATE TABLE IF NOT EXISTS courses (
+    id         TEXT PRIMARY KEY,
+    title      TEXT NOT NULL,
+    subtitle   TEXT,
+    icon       TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+INSERT INTO courses (id, title, subtitle, icon) VALUES
+    ('bos', 'Бизнес Операционная Система', 'Александр Высоцкий', '📚')
+ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS user_course_access (
+    user_id    BIGINT NOT NULL REFERENCES users (telegram_id) ON DELETE CASCADE,
+    course_id  TEXT NOT NULL REFERENCES courses (id) ON DELETE CASCADE,
+    granted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    granted_by BIGINT,
+    PRIMARY KEY (user_id, course_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_course_access_user_id ON user_course_access (user_id);
 
 CREATE TABLE IF NOT EXISTS allowed_phones (
     phone_number TEXT PRIMARY KEY,
@@ -103,10 +128,15 @@ async def get_user(telegram_id: int) -> Optional[asyncpg.Record]:
     return await _get_pool().fetchrow("SELECT * FROM users WHERE telegram_id = $1", telegram_id)
 
 
+async def get_user_by_phone(phone_number: str) -> Optional[asyncpg.Record]:
+    return await _get_pool().fetchrow("SELECT * FROM users WHERE phone_number = $1", phone_number)
+
+
 async def upsert_user(
     telegram_id: int,
     *,
     phone_number: Optional[str] = None,
+    username: Optional[str] = None,
     is_admin: Optional[bool] = None,
     is_allowed: Optional[bool] = None,
 ) -> asyncpg.Record:
@@ -118,16 +148,18 @@ async def upsert_user(
     """
     return await _get_pool().fetchrow(
         """
-        INSERT INTO users (telegram_id, phone_number, is_admin, is_allowed)
-        VALUES ($1, $2, COALESCE($3, FALSE), COALESCE($4, FALSE))
+        INSERT INTO users (telegram_id, phone_number, username, is_admin, is_allowed)
+        VALUES ($1, $2, $3, COALESCE($4, FALSE), COALESCE($5, FALSE))
         ON CONFLICT (telegram_id) DO UPDATE SET
             phone_number = COALESCE($2, users.phone_number),
-            is_admin     = COALESCE($3, users.is_admin),
-            is_allowed   = COALESCE($4, users.is_allowed)
+            username     = COALESCE($3, users.username),
+            is_admin     = COALESCE($4, users.is_admin),
+            is_allowed   = COALESCE($5, users.is_allowed)
         RETURNING *
         """,
         telegram_id,
         phone_number,
+        username,
         is_admin,
         is_allowed,
     )
@@ -176,6 +208,101 @@ async def list_users() -> list[asyncpg.Record]:
     return await _get_pool().fetch(
         "SELECT * FROM users WHERE is_allowed OR is_admin ORDER BY created_at"
     )
+
+
+async def list_all_users_with_access() -> list[asyncpg.Record]:
+    """All registered users with the list of course_ids each has access to
+    (for the admin panel — includes users with no course access yet)."""
+    return await _get_pool().fetch(
+        """
+        SELECT
+            u.telegram_id AS user_id,
+            u.username,
+            u.phone_number,
+            u.is_admin,
+            u.is_allowed,
+            u.created_at,
+            COALESCE(
+                array_agg(uca.course_id) FILTER (WHERE uca.course_id IS NOT NULL),
+                '{}'
+            ) AS course_ids
+        FROM users u
+        LEFT JOIN user_course_access uca ON uca.user_id = u.telegram_id
+        GROUP BY u.telegram_id
+        ORDER BY u.created_at
+        """
+    )
+
+
+# ─── Courses ────────────────────────────────────────────────────────────
+
+
+async def list_courses() -> list[asyncpg.Record]:
+    return await _get_pool().fetch("SELECT * FROM courses ORDER BY id")
+
+
+async def get_course(course_id: str) -> Optional[asyncpg.Record]:
+    return await _get_pool().fetchrow("SELECT * FROM courses WHERE id = $1", course_id)
+
+
+# ─── Per-user course access ─────────────────────────────────────────────
+
+
+async def has_course_access(user_id: int, course_id: str) -> bool:
+    row = await _get_pool().fetchrow(
+        "SELECT 1 FROM user_course_access WHERE user_id = $1 AND course_id = $2",
+        user_id,
+        course_id,
+    )
+    return row is not None
+
+
+async def get_user_courses(user_id: int) -> list[asyncpg.Record]:
+    """Courses a user has access to, joined with their display metadata."""
+    return await _get_pool().fetch(
+        """
+        SELECT c.id, c.title, c.subtitle, c.icon
+        FROM user_course_access uca
+        JOIN courses c ON c.id = uca.course_id
+        WHERE uca.user_id = $1
+        ORDER BY c.id
+        """,
+        user_id,
+    )
+
+
+async def grant_course_access(
+    user_id: int, course_id: str, granted_by: Optional[int] = None
+) -> asyncpg.Record:
+    """Grant course access, creating a placeholder user row first if needed
+    so the foreign key is always satisfied (mirrors record_stat's pattern)."""
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "INSERT INTO users (telegram_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id
+            )
+            return await conn.fetchrow(
+                """
+                INSERT INTO user_course_access (user_id, course_id, granted_by)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (user_id, course_id) DO UPDATE SET
+                    granted_by = COALESCE($3, user_course_access.granted_by)
+                RETURNING *
+                """,
+                user_id,
+                course_id,
+                granted_by,
+            )
+
+
+async def revoke_course_access(user_id: int, course_id: str) -> bool:
+    result = await _get_pool().execute(
+        "DELETE FROM user_course_access WHERE user_id = $1 AND course_id = $2",
+        user_id,
+        course_id,
+    )
+    return result != "DELETE 0"
 
 
 # ─── Allowed phones (pre-approval before first contact) ───────────────────

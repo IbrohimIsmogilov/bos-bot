@@ -1,16 +1,20 @@
-"""Course content (video IDs and topic timecodes).
+"""Course content (video IDs and topic timecodes), for all BilimBook courses.
 
 This data used to live in a public `data.js` bundled with the frontend, which
 leaked the (unlisted) YouTube video IDs to anyone with the WebApp URL. It now
-lives in the backend and is served only to authenticated users via
-`GET /api/course` (see bot.py), after their Telegram `initData` has been
-verified.
+lives in the backend and is served only to authenticated, entitled users via
+`GET /api/course?course_id=...` (see bot.py), after their Telegram `initData`
+has been verified and their `user_course_access` row checked.
 
 All timecodes are stored as plain integer seconds. `endSeconds` is derived
 automatically from the start of the next topic so the player can scale its
 progress bar to the current topic's segment (see the "Этап 6" logic in
 bos-course/main.js). The last topic of a video has `endSeconds = None`,
 meaning "play until the end of the video".
+
+`COURSES` is the registry of course content, keyed by course_id (matching
+the `courses` table in Supabase). To add a new course, add a new
+`_build_<course>_course()` function and register it below.
 """
 
 import re
@@ -338,9 +342,15 @@ def _build_roadmap() -> dict:
     }
 
 
-COURSE_DATA = {
-    "days": _build_days(),
-    "bonuses": _build_bonuses(),
-    "tools": _build_tools(),
-    "roadmap": _build_roadmap(),
+def _build_bos_course() -> dict:
+    return {
+        "days": _build_days(),
+        "bonuses": _build_bonuses(),
+        "tools": _build_tools(),
+        "roadmap": _build_roadmap(),
+    }
+
+
+COURSES: dict[str, dict] = {
+    "bos": _build_bos_course(),
 }
