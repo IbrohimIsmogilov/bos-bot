@@ -452,9 +452,12 @@ async def _has_course_access(user_id: int, course_id: str) -> bool:
     return await db.has_course_access(user_id, course_id)
 
 
-def _require_admin(user_id: int) -> None:
-    if user_id not in ADMIN_USER_IDS:
-        raise web.HTTPForbidden(reason="admin access required")
+async def _require_admin(user_id: int) -> None:
+    if user_id in ADMIN_USER_IDS:
+        return
+    if await is_admin(user_id):
+        return
+    raise web.HTTPForbidden(reason="admin access required")
 
 
 def _row_to_dict(row: asyncpg.Record) -> dict:
@@ -537,14 +540,14 @@ async def handle_stats(request: web.Request) -> web.Response:
 
 async def handle_admin_users(request: web.Request) -> web.Response:
     user = await _authenticate(request)
-    _require_admin(user["id"])
+    await _require_admin(user["id"])
     rows = await db.list_all_users_with_access()
     return web.json_response([_row_to_dict(r) for r in rows])
 
 
 async def handle_admin_grant_access(request: web.Request) -> web.Response:
     admin_user = await _authenticate(request)
-    _require_admin(admin_user["id"])
+    await _require_admin(admin_user["id"])
 
     try:
         payload = await request.json()
@@ -582,7 +585,7 @@ async def _validate_course_ids(course_ids) -> list:
 
 async def handle_admin_add_user_by_id(request: web.Request) -> web.Response:
     admin_user = await _authenticate(request)
-    _require_admin(admin_user["id"])
+    await _require_admin(admin_user["id"])
 
     try:
         payload = await request.json()
@@ -602,7 +605,7 @@ async def handle_admin_add_user_by_id(request: web.Request) -> web.Response:
 
 async def handle_admin_add_user_by_phone(request: web.Request) -> web.Response:
     admin_user = await _authenticate(request)
-    _require_admin(admin_user["id"])
+    await _require_admin(admin_user["id"])
 
     try:
         payload = await request.json()
@@ -632,7 +635,7 @@ async def handle_admin_add_user_by_phone(request: web.Request) -> web.Response:
 
 async def handle_admin_delete_user(request: web.Request) -> web.Response:
     admin_user = await _authenticate(request)
-    _require_admin(admin_user["id"])
+    await _require_admin(admin_user["id"])
 
     try:
         payload = await request.json()
@@ -703,7 +706,7 @@ def _classify_stat(day: str, topic: str, progress: int):
 
 async def handle_admin_stats(request: web.Request) -> web.Response:
     user = await _authenticate(request)
-    _require_admin(user["id"])
+    await _require_admin(user["id"])
 
     raw = await db.get_admin_stats_summary()
 
