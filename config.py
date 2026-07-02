@@ -7,6 +7,10 @@ WEBAPP_URL = os.environ.get("WEBAPP_URL", "https://kslmvv.github.io/bos-course/"
 DATABASE_URL = os.environ["DATABASE_URL"]
 PORT = int(os.environ.get("PORT", "8080"))
 
+# Groq API key — powers both Whisper transcription and the Llama topic-
+# grouping step of the automated lesson-ingestion pipeline (lesson_pipeline.py).
+GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+
 # Telegram user IDs allowed to call the /api/admin/* endpoints, as a
 # comma-separated list (e.g. "111111,222222"). Falls back to just ADMIN_ID
 # (the bot's super-admin) if unset.

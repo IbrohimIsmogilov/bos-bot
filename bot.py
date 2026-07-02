@@ -18,8 +18,17 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 import auth
 import db
-from config import ADMIN_ID, ADMIN_USER_IDS, BOT_TOKEN, PORT, WEBAPP_ORIGIN, WEBAPP_URL
+import lesson_pipeline
+from config import ADMIN_ID, ADMIN_USER_IDS, BOT_TOKEN, GROQ_API_KEY, PORT, WEBAPP_ORIGIN, WEBAPP_URL
 from course_data import COURSES
+
+# Matches a YouTube watch/shorts/short-link URL anywhere in an admin's
+# message — see lesson_link_handler (Этап 1 of automated lesson ingestion).
+YOUTUBE_URL_RE = re.compile(r"https?://(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/)\S+|youtu\.be/\S+)")
+
+# Background pipeline tasks (asyncio.create_task) must be kept referenced
+# somewhere, or the event loop is free to garbage-collect them mid-run.
+_background_tasks: set[asyncio.Task] = set()
 
 # Course granted automatically to every approved bot member until the
 # frontend/bot flows are updated (Этап 2) to let admins pick per-course
@@ -390,6 +399,68 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         text = "/start — мои курсы"
     await update.message.reply_text(text)
+
+
+# ─── Automated lesson ingestion (Этап 1: YouTube → transcript → draft topics) ──
+
+
+def _spawn_background(coro) -> None:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def lesson_link_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """An admin posts a YouTube link -> validate it, create a pending_lessons
+    row, and kick off the download/transcribe/group pipeline in the
+    background. Silently ignored for non-admins and for messages without a
+    YouTube link, so it never interferes with any other text flow."""
+    text = update.message.text or ""
+    match = YOUTUBE_URL_RE.search(text)
+    if not match:
+        return
+    user_id = update.effective_user.id
+    if not await is_admin(user_id):
+        return
+
+    url = match.group(0)
+    try:
+        info = await asyncio.to_thread(lesson_pipeline.probe_video, url)
+    except lesson_pipeline.PipelineError as exc:
+        await update.message.reply_text(f"❌ Не удалось обработать ссылку: {exc}")
+        return
+
+    lesson = await db.create_pending_lesson(url, info["video_id"], info["title"], created_by=user_id)
+    await update.message.reply_text(f"⏳ Начал обработку видео «{info['title']}»...")
+
+    _spawn_background(
+        process_pending_lesson(lesson["id"], update.effective_chat.id, ctx.bot, url, info["title"])
+    )
+
+
+async def process_pending_lesson(lesson_id: int, chat_id: int, bot, url: str, title: str) -> None:
+    """Runs the heavy download/transcribe/group pipeline off the event loop
+    (via asyncio.to_thread) and reports progress/errors back to the admin
+    who requested it. Any failure updates status=failed with error_message
+    instead of leaving the lesson stuck in an earlier in-progress status."""
+    try:
+        await db.update_pending_lesson_status(lesson_id, "transcribing")
+        segments = await asyncio.to_thread(lesson_pipeline.download_and_transcribe, url, GROQ_API_KEY)
+
+        await db.update_pending_lesson_status(lesson_id, "grouping")
+        topics = await asyncio.to_thread(lesson_pipeline.group_into_topics, title, segments, GROQ_API_KEY)
+
+        await db.add_pending_lesson_topics(lesson_id, topics)
+        await db.update_pending_lesson_status(lesson_id, "ready_for_review")
+        await bot.send_message(chat_id, f"✅ Транскрипт готов, {len(topics)} тем найдено.")
+    except lesson_pipeline.PipelineError as exc:
+        logger.warning("Lesson %s pipeline failed: %s", lesson_id, exc)
+        await db.update_pending_lesson_status(lesson_id, "failed", error_message=str(exc)[:500])
+        await bot.send_message(chat_id, f"❌ Ошибка обработки видео «{title}»: {exc}")
+    except Exception as exc:
+        logger.exception("Lesson %s pipeline crashed", lesson_id)
+        await db.update_pending_lesson_status(lesson_id, "failed", error_message=str(exc)[:500])
+        await bot.send_message(chat_id, f"❌ Непредвиденная ошибка при обработке видео «{title}».")
 
 
 async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -800,6 +871,7 @@ async def main() -> None:
     application.add_handler(CommandHandler("stats", stats_cmd))
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(MessageHandler(filters.CONTACT, contact_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lesson_link_handler))
     application.add_error_handler(error_handler)
 
     runner = web.AppRunner(build_web_app())

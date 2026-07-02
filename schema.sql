@@ -100,3 +100,34 @@ CREATE TABLE IF NOT EXISTS browser_tokens (
     topic       TEXT,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Automated lesson-ingestion pipeline (Этап 1): admin posts a YouTube link,
+-- the bot downloads/transcribes/groups it into a draft topic outline here
+-- for review, before anything is written to courses/course_data.py.
+CREATE TABLE IF NOT EXISTS pending_lessons (
+    id                  BIGSERIAL PRIMARY KEY,
+    source_youtube_url  TEXT NOT NULL,
+    video_id            TEXT NOT NULL,
+    video_title         TEXT,
+    status              TEXT NOT NULL DEFAULT 'processing'
+                         CHECK (status IN (
+                             'processing', 'transcribing', 'grouping',
+                             'ready_for_review', 'published', 'failed'
+                         )),
+    created_by          BIGINT NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    error_message       TEXT
+);
+
+-- Draft topic outline the LLM grouping step produces from the transcript —
+-- editable by an admin in the (future) WebApp review screen before publish.
+CREATE TABLE IF NOT EXISTS pending_lesson_topics (
+    id                 BIGSERIAL PRIMARY KEY,
+    pending_lesson_id  BIGINT NOT NULL REFERENCES pending_lessons (id) ON DELETE CASCADE,
+    position           INTEGER NOT NULL,
+    title              TEXT NOT NULL,
+    start_seconds      INTEGER NOT NULL,
+    UNIQUE (pending_lesson_id, position)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_lesson_topics_lesson_id ON pending_lesson_topics (pending_lesson_id);

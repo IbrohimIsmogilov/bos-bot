@@ -91,6 +91,37 @@ CREATE TABLE IF NOT EXISTS browser_tokens (
     topic       TEXT,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Automated lesson-ingestion pipeline (Этап 1): admin posts a YouTube link,
+-- the bot downloads/transcribes/groups it into a draft topic outline here
+-- for review, before anything is written to courses/course_data.py.
+CREATE TABLE IF NOT EXISTS pending_lessons (
+    id                  BIGSERIAL PRIMARY KEY,
+    source_youtube_url  TEXT NOT NULL,
+    video_id            TEXT NOT NULL,
+    video_title         TEXT,
+    status              TEXT NOT NULL DEFAULT 'processing'
+                         CHECK (status IN (
+                             'processing', 'transcribing', 'grouping',
+                             'ready_for_review', 'published', 'failed'
+                         )),
+    created_by          BIGINT NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    error_message       TEXT
+);
+
+-- Draft topic outline the LLM grouping step produces from the transcript —
+-- editable by an admin in the (future) WebApp review screen before publish.
+CREATE TABLE IF NOT EXISTS pending_lesson_topics (
+    id                 BIGSERIAL PRIMARY KEY,
+    pending_lesson_id  BIGINT NOT NULL REFERENCES pending_lessons (id) ON DELETE CASCADE,
+    position           INTEGER NOT NULL,
+    title              TEXT NOT NULL,
+    start_seconds      INTEGER NOT NULL,
+    UNIQUE (pending_lesson_id, position)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_lesson_topics_lesson_id ON pending_lesson_topics (pending_lesson_id);
 """
 
 # How long a "Открыть в браузере" token remains valid after creation. Long
@@ -511,4 +542,63 @@ async def get_browser_token(token: str) -> Optional[asyncpg.Record]:
         WHERE token = $1 AND created_at > now() - interval '{BROWSER_TOKEN_TTL}'
         """,
         token,
+    )
+
+
+# ─── Pending lessons (automated lesson-ingestion pipeline) ────────────────
+
+
+async def create_pending_lesson(
+    source_youtube_url: str, video_id: str, video_title: Optional[str], created_by: int
+) -> asyncpg.Record:
+    return await _get_pool().fetchrow(
+        """
+        INSERT INTO pending_lessons (source_youtube_url, video_id, video_title, created_by)
+        VALUES ($1, $2, $3, $4)
+        RETURNING *
+        """,
+        source_youtube_url,
+        video_id,
+        video_title,
+        created_by,
+    )
+
+
+async def update_pending_lesson_status(
+    pending_lesson_id: int, status: str, error_message: Optional[str] = None
+) -> None:
+    await _get_pool().execute(
+        "UPDATE pending_lessons SET status = $2, error_message = $3 WHERE id = $1",
+        pending_lesson_id,
+        status,
+        error_message,
+    )
+
+
+async def get_pending_lesson(pending_lesson_id: int) -> Optional[asyncpg.Record]:
+    return await _get_pool().fetchrow("SELECT * FROM pending_lessons WHERE id = $1", pending_lesson_id)
+
+
+async def list_pending_lessons() -> list[asyncpg.Record]:
+    return await _get_pool().fetch("SELECT * FROM pending_lessons ORDER BY created_at DESC")
+
+
+async def add_pending_lesson_topics(pending_lesson_id: int, topics: list[dict]) -> None:
+    """Bulk-insert the LLM-grouped draft topic outline, ordered by position."""
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.executemany(
+                """
+                INSERT INTO pending_lesson_topics (pending_lesson_id, position, title, start_seconds)
+                VALUES ($1, $2, $3, $4)
+                """,
+                [(pending_lesson_id, i, t["title"], t["start_seconds"]) for i, t in enumerate(topics)],
+            )
+
+
+async def get_pending_lesson_topics(pending_lesson_id: int) -> list[asyncpg.Record]:
+    return await _get_pool().fetch(
+        "SELECT * FROM pending_lesson_topics WHERE pending_lesson_id = $1 ORDER BY position",
+        pending_lesson_id,
     )
