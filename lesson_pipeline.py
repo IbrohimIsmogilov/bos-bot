@@ -40,6 +40,13 @@ GROUP_WINDOW_DELAY_SECONDS = 2.0  # pacing between sequential chunk calls
 LLM_MAX_RETRIES = 5
 LLM_RETRY_BASE_DELAY = 2.0  # seconds; doubles each attempt, plus jitter
 
+# A Retry-After above this is not a short burst limit worth silently
+# sleeping through — it's almost always Groq's daily token cap (TPD), which
+# won't clear for the rest of the day regardless of how many times we retry.
+# Fail fast with a clear message instead of blocking an admin's request for
+# up to ~1.5h with zero feedback.
+LLM_MAX_RETRY_DELAY = 90.0
+
 
 class PipelineError(Exception):
     """Raised for any expected failure (bad link, ffmpeg/API error) so
@@ -50,11 +57,30 @@ def get_groq_client(groq_api_key: str) -> Groq:
     return Groq(api_key=groq_api_key)
 
 
+def _format_wait(seconds: float) -> str:
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}ч{m}м"
+    if m:
+        return f"{m}м{s}с"
+    return f"{s}с"
+
+
 def _call_groq_with_retry(fn, *, max_retries: int = LLM_MAX_RETRIES):
     """Call a Groq SDK function, retrying on 429 (rate limit) / 413 (payload
     too large) with exponential backoff — honoring a Retry-After header when
     Groq sends one. Any other error, or exhausting all retries, raises
-    PipelineError so callers never see a raw SDK exception."""
+    PipelineError so callers never see a raw SDK exception.
+
+    Groq marks quota errors a short retry can't fix (most commonly the daily
+    token cap, TPD — as opposed to the per-minute TPM burst limit) with
+    `x-should-retry: false` and a Retry-After of tens of minutes to hours.
+    Silently sleeping through that would block an admin's request for up to
+    ~1.5h with zero feedback and indistinguishable from a hang, so those
+    fail immediately with a clear message instead of being retried.
+    """
     last_exc: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
@@ -62,14 +88,25 @@ def _call_groq_with_retry(fn, *, max_retries: int = LLM_MAX_RETRIES):
         except groq.APIStatusError as exc:
             if exc.status_code not in (429, 413):
                 raise PipelineError(f"Groq API вернул ошибку {exc.status_code}: {exc}") from exc
+
+            headers = exc.response.headers if exc.response is not None else {}
+            should_retry = headers.get("x-should-retry")
+            retry_after_raw = headers.get("retry-after")
+            try:
+                retry_after = float(retry_after_raw) if retry_after_raw else None
+            except ValueError:
+                retry_after = None
+
+            if should_retry == "false" or (retry_after is not None and retry_after > LLM_MAX_RETRY_DELAY):
+                wait_msg = f", повторить можно через {_format_wait(retry_after)}" if retry_after else ""
+                raise PipelineError(
+                    f"Groq API: лимит токенов исчерпан{wait_msg} ({exc})"
+                ) from exc
+
             last_exc = exc
             if attempt == max_retries:
                 break
-            retry_after = exc.response.headers.get("retry-after") if exc.response is not None else None
-            try:
-                delay = float(retry_after) if retry_after else LLM_RETRY_BASE_DELAY * (2 ** attempt)
-            except ValueError:
-                delay = LLM_RETRY_BASE_DELAY * (2 ** attempt)
+            delay = retry_after if retry_after is not None else LLM_RETRY_BASE_DELAY * (2 ** attempt)
             delay += random.uniform(0, 1)  # jitter, avoid retry bursts lining back up
             logger.warning(
                 "Groq API вернул %s, повтор через %.1fс (попытка %d/%d)",
