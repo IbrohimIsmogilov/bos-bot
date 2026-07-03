@@ -1,8 +1,10 @@
 import asyncio
+import copy
 import datetime
 import json
 import logging
 import re
+from typing import Optional
 
 import asyncpg
 from aiohttp import web
@@ -488,7 +490,7 @@ async def cors_middleware(request: web.Request, handler):
             response = exc
     response.headers["Access-Control-Allow-Origin"] = WEBAPP_ORIGIN
     response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, OPTIONS"
     return response
 
 
@@ -539,17 +541,86 @@ async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
 
 
+def _topics_from_db_rows(rows: list[asyncpg.Record]) -> list[dict]:
+    """Same {title, startSeconds, endSeconds} shape as course_data.py's
+    _build_topics — endSeconds is the next topic's start, None for the last."""
+    topics = []
+    for i, row in enumerate(rows):
+        end = rows[i + 1]["start_seconds"] if i + 1 < len(rows) else None
+        topics.append({"title": row["title"], "startSeconds": row["start_seconds"], "endSeconds": end})
+    return topics
+
+
+async def _db_video_to_day(video: asyncpg.Record, day_id: int) -> dict:
+    """One db_course_videos row -> a "day" entry in the {days: [...]} shape.
+    `videoHlsUrl` is a slight misnomer here (it's a bare YouTube video ID,
+    not an HLS URL) — main.js's loadVideo() picks the playback backend by
+    checking whether the value looks like an http(s) URL, so a bare ID in
+    this field is routed to the YouTube player exactly as intended."""
+    topics = _topics_from_db_rows(await db.get_course_video_topics(video["id"]))
+    return {
+        "id": day_id,
+        "title": video["title"] or f"День {day_id}",
+        "videoHlsUrl": video["video_id"],
+        "topics": topics,
+    }
+
+
+async def _build_course_payload(course_id: str, hardcoded: Optional[dict], course_row) -> dict:
+    """Assemble the GET /api/course response for one course_id, per the
+    Этап 2 spec's three cases:
+
+    1. course_id is a hardcoded multi-day course (has "days") -> DB videos
+       for it are appended as extra days at the end.
+    2. course_id isn't hardcoded and has exactly one DB video -> flat
+       {videoId, topics} shape (same as "roadmap" today; the frontend
+       already treats this structurally via isSingleVideoCourse()).
+    3. course_id isn't hardcoded and has 2+ DB videos -> {days: [...]},
+       same shape as case 1 minus bonuses/tools.
+
+    A hardcoded course without "days" (e.g. "roadmap", a single fixed
+    video) is returned unchanged — Этап 2 doesn't support layering DB
+    lessons onto that shape, and handle_admin_publish_pending_lesson
+    rejects "existing_course" targets that would need it to.
+    """
+    if hardcoded is not None and "days" in hardcoded:
+        payload = copy.deepcopy(hardcoded)
+        next_day_id = max((d["id"] for d in payload["days"]), default=0) + 1
+        for video in await db.get_course_videos(course_id):
+            payload["days"].append(await _db_video_to_day(video, next_day_id))
+            next_day_id += 1
+        return payload
+
+    if hardcoded is not None:
+        return hardcoded
+
+    videos = await db.get_course_videos(course_id)
+    if len(videos) == 1:
+        video = videos[0]
+        topics = _topics_from_db_rows(await db.get_course_video_topics(video["id"]))
+        return {"id": course_id, "title": course_row["title"], "videoId": video["video_id"], "topics": topics}
+
+    days = []
+    for i, video in enumerate(videos, start=1):
+        days.append(await _db_video_to_day(video, i))
+    return {"days": days}
+
+
 async def handle_course(request: web.Request) -> web.Response:
     # Defaults to the only course that exists today so the not-yet-updated
     # frontend (Этап 2) keeps working unchanged during the transition.
     user_id = await _resolve_user_id(request)
 
     course_id = request.query.get("course_id", DEFAULT_COURSE_ID)
-    if course_id not in COURSES:
+    hardcoded = COURSES.get(course_id)
+    course_row = None if hardcoded is not None else await db.get_course(course_id)
+    if hardcoded is None and course_row is None:
         raise web.HTTPNotFound(reason="unknown course_id")
     if not await _has_course_access(user_id, course_id):
         raise web.HTTPForbidden(reason="access denied")
-    return web.json_response(COURSES[course_id])
+
+    payload = await _build_course_payload(course_id, hardcoded, course_row)
+    return web.json_response(payload)
 
 
 async def handle_my_courses(request: web.Request) -> web.Response:
@@ -838,6 +909,187 @@ async def handle_admin_stats(request: web.Request) -> web.Response:
     )
 
 
+# ─── Admin API: publish flow (Этап 2) ───────────────────────────────────
+
+
+async def handle_admin_courses(request: web.Request) -> web.Response:
+    """Courses eligible as an "existing_course" publish target — i.e.
+    anything that isn't a hardcoded single-video course like "roadmap",
+    which _build_course_payload doesn't know how to layer a DB lesson onto."""
+    user = await _authenticate(request)
+    await _require_admin(user["id"])
+    rows = await db.list_courses()
+    result = []
+    for r in rows:
+        hardcoded = COURSES.get(r["id"])
+        if hardcoded is not None and "days" not in hardcoded:
+            continue
+        result.append({"id": r["id"], "title": r["title"], "subtitle": r["subtitle"], "icon": r["icon"]})
+    return web.json_response(result)
+
+
+async def handle_admin_pending_lessons(request: web.Request) -> web.Response:
+    user = await _authenticate(request)
+    await _require_admin(user["id"])
+    rows = await db.list_pending_lessons_summary()
+    return web.json_response([_row_to_dict(r) for r in rows])
+
+
+def _parse_lesson_id(request: web.Request) -> int:
+    try:
+        return int(request.match_info["id"])
+    except ValueError:
+        raise web.HTTPBadRequest(reason="invalid lesson id")
+
+
+async def handle_admin_pending_lesson_detail(request: web.Request) -> web.Response:
+    user = await _authenticate(request)
+    await _require_admin(user["id"])
+    lesson_id = _parse_lesson_id(request)
+
+    lesson = await db.get_pending_lesson(lesson_id)
+    if not lesson:
+        raise web.HTTPNotFound(reason="unknown pending lesson")
+
+    topics = await db.get_pending_lesson_topics(lesson_id)
+    result = _row_to_dict(lesson)
+    result["topics"] = [{"title": t["title"], "start_seconds": t["start_seconds"]} for t in topics]
+    return web.json_response(result)
+
+
+def _validate_topics_payload(payload) -> list[dict]:
+    if not isinstance(payload, list) or not payload:
+        raise web.HTTPBadRequest(reason="body must be a non-empty JSON array of {title, start_seconds}")
+    topics = []
+    for item in payload:
+        if not isinstance(item, dict):
+            raise web.HTTPBadRequest(reason="each topic must be an object")
+        title = item.get("title")
+        start_seconds = item.get("start_seconds")
+        if not isinstance(title, str) or not title.strip():
+            raise web.HTTPBadRequest(reason="each topic needs a non-empty title")
+        if isinstance(start_seconds, bool) or not isinstance(start_seconds, int) or start_seconds < 0:
+            raise web.HTTPBadRequest(reason="each topic needs a non-negative integer start_seconds")
+        topics.append({"title": title.strip()[:300], "start_seconds": start_seconds})
+    # The editor lets an admin add/delete/reorder rows freely, so the array
+    # it sends isn't guaranteed to already be chronological — but every
+    # consumer (endSeconds derivation in _topics_from_db_rows, position as
+    # stored order) assumes ascending start_seconds. Sorting here (not
+    # rejecting) keeps that invariant without pushing manual reordering onto
+    # the admin.
+    topics.sort(key=lambda t: t["start_seconds"])
+    return topics
+
+
+async def handle_admin_pending_lesson_topics(request: web.Request) -> web.Response:
+    user = await _authenticate(request)
+    await _require_admin(user["id"])
+    lesson_id = _parse_lesson_id(request)
+
+    if not await db.get_pending_lesson(lesson_id):
+        raise web.HTTPNotFound(reason="unknown pending lesson")
+
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        raise web.HTTPBadRequest(reason="invalid JSON body")
+
+    topics = _validate_topics_payload(payload)
+    await db.replace_pending_lesson_topics(lesson_id, topics)
+    return web.json_response({"ok": True})
+
+
+# Cyrillic -> Latin transliteration for auto-generating a course_id slug
+# from a Russian course title (see handle_admin_publish_pending_lesson,
+# mode="new_course" without an explicit course_id).
+_CYRILLIC_TRANSLIT = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e", "ж": "zh", "з": "z",
+    "и": "i", "й": "y", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r",
+    "с": "s", "т": "t", "у": "u", "ф": "f", "х": "h", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+}
+_SLUG_STRIP_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _slugify(title: str) -> str:
+    translit = "".join(_CYRILLIC_TRANSLIT.get(ch, ch) for ch in title.lower())
+    return _SLUG_STRIP_RE.sub("-", translit).strip("-")[:60]
+
+
+async def handle_admin_publish_pending_lesson(request: web.Request) -> web.Response:
+    admin_user = await _authenticate(request)
+    await _require_admin(admin_user["id"])
+    lesson_id = _parse_lesson_id(request)
+
+    lesson = await db.get_pending_lesson(lesson_id)
+    if not lesson:
+        raise web.HTTPNotFound(reason="unknown pending lesson")
+    if lesson["status"] != "ready_for_review":
+        raise web.HTTPBadRequest(reason=f"lesson status is {lesson['status']!r}, expected ready_for_review")
+
+    topic_rows = await db.get_pending_lesson_topics(lesson_id)
+    if not topic_rows:
+        raise web.HTTPBadRequest(reason="lesson has no topics to publish")
+    topics = [{"title": t["title"], "start_seconds": t["start_seconds"]} for t in topic_rows]
+
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        raise web.HTTPBadRequest(reason="invalid JSON body")
+    if not isinstance(payload, dict):
+        raise web.HTTPBadRequest(reason="invalid JSON body")
+
+    mode = payload.get("mode")
+    if mode == "new_course":
+        title = payload.get("title")
+        if not isinstance(title, str) or not title.strip():
+            raise web.HTTPBadRequest(reason="title is required")
+        title = title.strip()
+        subtitle = payload.get("subtitle")
+        subtitle = subtitle.strip() if isinstance(subtitle, str) and subtitle.strip() else None
+
+        explicit_course_id = payload.get("course_id")
+        if isinstance(explicit_course_id, str) and explicit_course_id.strip():
+            course_id = explicit_course_id.strip()
+            if await db.get_course(course_id):
+                raise web.HTTPConflict(reason=f"course_id already exists: {course_id}")
+        else:
+            base = _slugify(title) or "course"
+            course_id = base
+            suffix = 2
+            while await db.get_course(course_id):
+                course_id = f"{base}-{suffix}"
+                suffix += 1
+
+        await db.create_course(course_id, title, subtitle)
+        await db.add_course_video_with_topics(course_id, 0, None, lesson["video_id"], topics)
+
+    elif mode == "existing_course":
+        course_id = payload.get("course_id")
+        if not isinstance(course_id, str) or not course_id.strip():
+            raise web.HTTPBadRequest(reason="course_id is required")
+        course_id = course_id.strip()
+        day_title = payload.get("day_title")
+        if not isinstance(day_title, str) or not day_title.strip():
+            raise web.HTTPBadRequest(reason="day_title is required")
+
+        if not await db.get_course(course_id):
+            raise web.HTTPNotFound(reason="unknown course_id")
+        hardcoded = COURSES.get(course_id)
+        if hardcoded is not None and "days" not in hardcoded:
+            raise web.HTTPBadRequest(reason="this course does not support adding lessons")
+
+        position = await db.next_course_video_position(course_id)
+        await db.add_course_video_with_topics(course_id, position, day_title.strip(), lesson["video_id"], topics)
+
+    else:
+        raise web.HTTPBadRequest(reason="mode must be 'new_course' or 'existing_course'")
+
+    await db.update_pending_lesson_status(lesson_id, "published")
+    await db.grant_course_access(admin_user["id"], course_id, granted_by=admin_user["id"])
+    return web.json_response({"ok": True, "course_id": course_id})
+
+
 def build_web_app() -> web.Application:
     app = web.Application(middlewares=[cors_middleware])
     app.router.add_get("/health", handle_health)
@@ -851,6 +1103,11 @@ def build_web_app() -> web.Application:
     app.router.add_post("/api/admin/add-user-by-phone", handle_admin_add_user_by_phone)
     app.router.add_post("/api/admin/delete-user", handle_admin_delete_user)
     app.router.add_get("/api/admin/stats", handle_admin_stats)
+    app.router.add_get("/api/admin/courses", handle_admin_courses)
+    app.router.add_get("/api/admin/pending-lessons", handle_admin_pending_lessons)
+    app.router.add_get("/api/admin/pending-lessons/{id}", handle_admin_pending_lesson_detail)
+    app.router.add_patch("/api/admin/pending-lessons/{id}/topics", handle_admin_pending_lesson_topics)
+    app.router.add_post("/api/admin/pending-lessons/{id}/publish", handle_admin_publish_pending_lesson)
     app.router.add_route("OPTIONS", "/{tail:.*}", lambda request: web.Response(status=204))
     return app
 

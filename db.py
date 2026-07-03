@@ -122,6 +122,29 @@ CREATE TABLE IF NOT EXISTS pending_lesson_topics (
 );
 
 CREATE INDEX IF NOT EXISTS idx_pending_lesson_topics_lesson_id ON pending_lesson_topics (pending_lesson_id);
+
+CREATE TABLE IF NOT EXISTS db_course_videos (
+    id         BIGSERIAL PRIMARY KEY,
+    course_id  TEXT NOT NULL REFERENCES courses (id) ON DELETE CASCADE,
+    position   INTEGER NOT NULL,
+    title      TEXT,
+    video_id   TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (course_id, position)
+);
+
+CREATE INDEX IF NOT EXISTS idx_db_course_videos_course_id ON db_course_videos (course_id);
+
+CREATE TABLE IF NOT EXISTS db_course_topics (
+    id                 BIGSERIAL PRIMARY KEY,
+    db_course_video_id BIGINT NOT NULL REFERENCES db_course_videos (id) ON DELETE CASCADE,
+    position           INTEGER NOT NULL,
+    title              TEXT NOT NULL,
+    start_seconds      INTEGER NOT NULL,
+    UNIQUE (db_course_video_id, position)
+);
+
+CREATE INDEX IF NOT EXISTS idx_db_course_topics_video_id ON db_course_topics (db_course_video_id);
 """
 
 # How long a "Открыть в браузере" token remains valid after creation. Long
@@ -315,6 +338,22 @@ async def list_courses() -> list[asyncpg.Record]:
 
 async def get_course(course_id: str) -> Optional[asyncpg.Record]:
     return await _get_pool().fetchrow("SELECT * FROM courses WHERE id = $1", course_id)
+
+
+async def create_course(
+    course_id: str, title: str, subtitle: Optional[str] = None, icon: Optional[str] = None
+) -> asyncpg.Record:
+    """Create a brand-new, entirely DB-backed course (Этап 2 publish flow,
+    mode="new_course"). Caller must have already checked course_id is free —
+    no ON CONFLICT here, since silently overwriting an existing course would
+    be a bug, not a race worth tolerating for this admin-only, low-volume path."""
+    return await _get_pool().fetchrow(
+        "INSERT INTO courses (id, title, subtitle, icon) VALUES ($1, $2, $3, $4) RETURNING *",
+        course_id,
+        title,
+        subtitle,
+        icon,
+    )
 
 
 # ─── Per-user course access ─────────────────────────────────────────────
@@ -602,3 +641,88 @@ async def get_pending_lesson_topics(pending_lesson_id: int) -> list[asyncpg.Reco
         "SELECT * FROM pending_lesson_topics WHERE pending_lesson_id = $1 ORDER BY position",
         pending_lesson_id,
     )
+
+
+async def list_pending_lessons_summary() -> list[asyncpg.Record]:
+    """Powers the admin panel's "Черновики уроков" list — one row per
+    pending lesson with its current topic count, newest first."""
+    return await _get_pool().fetch(
+        """
+        SELECT pl.id, pl.video_title, pl.status, pl.created_at, count(plt.id) AS topic_count
+        FROM pending_lessons pl
+        LEFT JOIN pending_lesson_topics plt ON plt.pending_lesson_id = pl.id
+        GROUP BY pl.id
+        ORDER BY pl.created_at DESC
+        """
+    )
+
+
+async def replace_pending_lesson_topics(pending_lesson_id: int, topics: list[dict]) -> None:
+    """Overwrite the full draft topic outline (admin's WebApp editor always
+    sends the complete list back, never a partial patch — see PATCH
+    /api/admin/pending-lessons/{id}/topics)."""
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "DELETE FROM pending_lesson_topics WHERE pending_lesson_id = $1", pending_lesson_id
+            )
+            await conn.executemany(
+                """
+                INSERT INTO pending_lesson_topics (pending_lesson_id, position, title, start_seconds)
+                VALUES ($1, $2, $3, $4)
+                """,
+                [(pending_lesson_id, i, t["title"], t["start_seconds"]) for i, t in enumerate(topics)],
+            )
+
+
+# ─── Published course videos (Этап 2: publish flow) ────────────────────────
+
+
+async def get_course_videos(course_id: str) -> list[asyncpg.Record]:
+    return await _get_pool().fetch(
+        "SELECT * FROM db_course_videos WHERE course_id = $1 ORDER BY position", course_id
+    )
+
+
+async def next_course_video_position(course_id: str) -> int:
+    return await _get_pool().fetchval(
+        "SELECT COALESCE(MAX(position) + 1, 0) FROM db_course_videos WHERE course_id = $1", course_id
+    )
+
+
+async def get_course_video_topics(db_course_video_id: int) -> list[asyncpg.Record]:
+    return await _get_pool().fetch(
+        "SELECT * FROM db_course_topics WHERE db_course_video_id = $1 ORDER BY position",
+        db_course_video_id,
+    )
+
+
+async def add_course_video_with_topics(
+    course_id: str, position: int, title: Optional[str], video_id: str, topics: list[dict]
+) -> asyncpg.Record:
+    """Publish a reviewed lesson: one db_course_videos row plus its topic
+    outline, inserted together so a course video is never left without any
+    topics if the process dies mid-way."""
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            video = await conn.fetchrow(
+                """
+                INSERT INTO db_course_videos (course_id, position, title, video_id)
+                VALUES ($1, $2, $3, $4)
+                RETURNING *
+                """,
+                course_id,
+                position,
+                title,
+                video_id,
+            )
+            await conn.executemany(
+                """
+                INSERT INTO db_course_topics (db_course_video_id, position, title, start_seconds)
+                VALUES ($1, $2, $3, $4)
+                """,
+                [(video["id"], i, t["title"], t["start_seconds"]) for i, t in enumerate(topics)],
+            )
+            return video

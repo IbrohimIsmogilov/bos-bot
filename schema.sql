@@ -131,3 +131,32 @@ CREATE TABLE IF NOT EXISTS pending_lesson_topics (
 );
 
 CREATE INDEX IF NOT EXISTS idx_pending_lesson_topics_lesson_id ON pending_lesson_topics (pending_lesson_id);
+
+-- Published lesson videos for a course (Этап 2). A course can be entirely
+-- DB-backed (no entry in course_data.py's COURSES at all) or a hardcoded
+-- multi-day course (e.g. "bos") that gets extra days appended from here —
+-- see _build_course_payload in bot.py for how the two are merged.
+CREATE TABLE IF NOT EXISTS db_course_videos (
+    id         BIGSERIAL PRIMARY KEY,
+    course_id  TEXT NOT NULL REFERENCES courses (id) ON DELETE CASCADE,
+    position   INTEGER NOT NULL,
+    title      TEXT,
+    video_id   TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (course_id, position)
+);
+
+CREATE INDEX IF NOT EXISTS idx_db_course_videos_course_id ON db_course_videos (course_id);
+
+-- The published (post-review) topic outline for a db_course_videos row —
+-- copied from pending_lesson_topics at publish time.
+CREATE TABLE IF NOT EXISTS db_course_topics (
+    id                 BIGSERIAL PRIMARY KEY,
+    db_course_video_id BIGINT NOT NULL REFERENCES db_course_videos (id) ON DELETE CASCADE,
+    position           INTEGER NOT NULL,
+    title              TEXT NOT NULL,
+    start_seconds      INTEGER NOT NULL,
+    UNIQUE (db_course_video_id, position)
+);
+
+CREATE INDEX IF NOT EXISTS idx_db_course_topics_video_id ON db_course_topics (db_course_video_id);
