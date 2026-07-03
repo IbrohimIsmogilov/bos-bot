@@ -7,9 +7,15 @@ WEBAPP_URL = os.environ.get("WEBAPP_URL", "https://kslmvv.github.io/bos-course/"
 DATABASE_URL = os.environ["DATABASE_URL"]
 PORT = int(os.environ.get("PORT", "8080"))
 
-# Groq API key — powers both Whisper transcription and the Llama topic-
-# grouping step of the automated lesson-ingestion pipeline (lesson_pipeline.py).
+# Groq API key — powers Whisper transcription in the automated lesson-
+# ingestion pipeline (lesson_pipeline.py).
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+
+# Cerebras API key — powers the LLM topic-grouping step of the same pipeline
+# (gpt-oss-120b via Cerebras's OpenAI-compatible endpoint). Separate from
+# Groq because Cerebras's free tier gives 1,000,000 tokens/day vs. Groq's
+# 100,000, which a multi-hour transcript can exhaust in one run.
+CEREBRAS_API_KEY = os.environ["CEREBRAS_API_KEY"]
 
 # Telegram user IDs allowed to call the /api/admin/* endpoints, as a
 # comma-separated list (e.g. "111111,222222"). Falls back to just ADMIN_ID

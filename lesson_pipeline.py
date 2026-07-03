@@ -20,31 +20,42 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import groq
+import openai
 import yt_dlp
 from groq import Groq
+from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
 CHUNK_MB = 22  # stay safely under Groq's 25 MB Whisper upload limit
 WHISPER_MODEL = "whisper-large-v3"
-GROUPING_MODEL = "llama-3.3-70b-versatile"
 
-# llama-3.3-70b-versatile's free-tier cap (12000 TPM) can't take a multi-hour
-# transcript in one request, so group_into_topics() splits it into windows of
-# real video time, with a small overlap so a topic isn't cut exactly at the
-# boundary between two windows.
+# Topic grouping runs on Cerebras (OpenAI-compatible endpoint), not Groq —
+# its free tier gives 1,000,000 tokens/day vs. Groq's 100,000, which a
+# multi-hour transcript can burn through in a single run. Whisper
+# transcription stays on Groq (see get_groq_client/transcribe_chunk).
+CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
+GROUPING_MODEL = "gpt-oss-120b"
+
+# The transcript is split into windows of real video time and grouped one
+# window at a time regardless of provider, both to keep each request's
+# token count reasonable and to keep individual LLM calls focused.
 GROUP_WINDOW_SECONDS = 15 * 60
 GROUP_WINDOW_OVERLAP_SECONDS = 90
-GROUP_WINDOW_DELAY_SECONDS = 2.0  # pacing between sequential chunk calls
+
+# Cerebras's free tier caps at 5 requests/minute — tighter than its token
+# budget for this workload by a wide margin, so pacing (not token size) is
+# the binding constraint. 60/5=12s is the bare minimum; pad it so per-call
+# latency/jitter can't push us over the boundary and trigger an avoidable 429.
+CEREBRAS_REQUEST_DELAY_SECONDS = 13.0
 
 LLM_MAX_RETRIES = 5
 LLM_RETRY_BASE_DELAY = 2.0  # seconds; doubles each attempt, plus jitter
 
 # A Retry-After above this is not a short burst limit worth silently
-# sleeping through — it's almost always Groq's daily token cap (TPD), which
-# won't clear for the rest of the day regardless of how many times we retry.
-# Fail fast with a clear message instead of blocking an admin's request for
-# up to ~1.5h with zero feedback.
+# sleeping through — it's almost always a daily/hourly token cap, which
+# won't clear soon regardless of how many times we retry. Fail fast with a
+# clear message instead of blocking an admin's request with zero feedback.
 LLM_MAX_RETRY_DELAY = 90.0
 
 
@@ -54,7 +65,15 @@ class PipelineError(Exception):
 
 
 def get_groq_client(groq_api_key: str) -> Groq:
-    return Groq(api_key=groq_api_key)
+    # max_retries=0: the SDK's own built-in retry-on-429 silently sleeps
+    # *before* our exception ever reaches _call_llm_with_retry, which can
+    # hide several minutes of retries/backoff behind what looks like one
+    # slow call. We do our own retry/fail-fast on top, so disable it here.
+    return Groq(api_key=groq_api_key, max_retries=0, timeout=120.0)
+
+
+def get_cerebras_client(cerebras_api_key: str) -> OpenAI:
+    return OpenAI(api_key=cerebras_api_key, base_url=CEREBRAS_BASE_URL, max_retries=0, timeout=60.0)
 
 
 def _format_wait(seconds: float) -> str:
@@ -68,26 +87,28 @@ def _format_wait(seconds: float) -> str:
     return f"{s}с"
 
 
-def _call_groq_with_retry(fn, *, max_retries: int = LLM_MAX_RETRIES):
-    """Call a Groq SDK function, retrying on 429 (rate limit) / 413 (payload
-    too large) with exponential backoff — honoring a Retry-After header when
-    Groq sends one. Any other error, or exhausting all retries, raises
-    PipelineError so callers never see a raw SDK exception.
+def _call_llm_with_retry(fn, status_error_cls, *, max_retries: int = LLM_MAX_RETRIES):
+    """Call an LLM SDK function (Groq or Cerebras/OpenAI — both Stainless-
+    generated clients with an identical APIStatusError shape), retrying on
+    429 (rate limit) / 413 (payload too large) with exponential backoff —
+    honoring a Retry-After header when the provider sends one. Any other
+    error, or exhausting all retries, raises PipelineError so callers never
+    see a raw SDK exception.
 
-    Groq marks quota errors a short retry can't fix (most commonly the daily
-    token cap, TPD — as opposed to the per-minute TPM burst limit) with
-    `x-should-retry: false` and a Retry-After of tens of minutes to hours.
-    Silently sleeping through that would block an admin's request for up to
-    ~1.5h with zero feedback and indistinguishable from a hang, so those
-    fail immediately with a clear message instead of being retried.
+    Some quota errors (e.g. Groq's daily token cap) can't be fixed by a
+    short retry — Groq flags those with `x-should-retry: false`; as a
+    provider-agnostic fallback, any Retry-After above LLM_MAX_RETRY_DELAY is
+    also treated as non-retryable. Silently sleeping through either would
+    block an admin's request for a long time with zero feedback, so those
+    fail immediately with a clear message instead.
     """
     last_exc: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
             return fn()
-        except groq.APIStatusError as exc:
+        except status_error_cls as exc:
             if exc.status_code not in (429, 413):
-                raise PipelineError(f"Groq API вернул ошибку {exc.status_code}: {exc}") from exc
+                raise PipelineError(f"LLM API вернул ошибку {exc.status_code}: {exc}") from exc
 
             headers = exc.response.headers if exc.response is not None else {}
             should_retry = headers.get("x-should-retry")
@@ -100,7 +121,7 @@ def _call_groq_with_retry(fn, *, max_retries: int = LLM_MAX_RETRIES):
             if should_retry == "false" or (retry_after is not None and retry_after > LLM_MAX_RETRY_DELAY):
                 wait_msg = f", повторить можно через {_format_wait(retry_after)}" if retry_after else ""
                 raise PipelineError(
-                    f"Groq API: лимит токенов исчерпан{wait_msg} ({exc})"
+                    f"LLM API: лимит запросов/токенов исчерпан{wait_msg} ({exc})"
                 ) from exc
 
             last_exc = exc
@@ -109,12 +130,12 @@ def _call_groq_with_retry(fn, *, max_retries: int = LLM_MAX_RETRIES):
             delay = retry_after if retry_after is not None else LLM_RETRY_BASE_DELAY * (2 ** attempt)
             delay += random.uniform(0, 1)  # jitter, avoid retry bursts lining back up
             logger.warning(
-                "Groq API вернул %s, повтор через %.1fс (попытка %d/%d)",
+                "LLM API вернула %s, повтор через %.1fс (попытка %d/%d)",
                 exc.status_code, delay, attempt + 1, max_retries,
             )
             time.sleep(delay)
     raise PipelineError(
-        f"Groq API: превышен лимит запросов после {max_retries} попыток "
+        f"LLM API: превышен лимит запросов после {max_retries} попыток "
         f"(HTTP {getattr(last_exc, 'status_code', '?')})"
     ) from last_exc
 
@@ -201,7 +222,7 @@ def transcribe_chunk(client: Groq, chunk_path: Path, offset_sec: float) -> list[
                 timestamp_granularities=["segment"],
             )
 
-    response = _call_groq_with_retry(_call)
+    response = _call_llm_with_retry(_call, groq.APIStatusError)
     segments = []
     for seg in response.segments:
         # SDK may return dicts or objects depending on version
@@ -250,6 +271,21 @@ def download_and_transcribe(youtube_url: str, groq_api_key: str) -> list[dict]:
     if not all_segments:
         raise PipelineError("транскрипция вернула пустой результат")
     return all_segments
+
+
+def _extract_json_content(resp) -> str:
+    """Reasoning models (gpt-oss-120b) can burn their whole max_tokens budget
+    on hidden chain-of-thought and finish with an empty final answer even
+    though the request itself succeeded — surface that as a clear
+    PipelineError instead of a confusing json.loads(None) crash."""
+    choice = resp.choices[0]
+    content = choice.message.content
+    if not content:
+        raise PipelineError(
+            f"LLM вернул пустой ответ (finish_reason={choice.finish_reason}) — "
+            "вероятно, не хватило max_tokens на рассуждение"
+        )
+    return content
 
 
 def _parse_topics_response(data) -> list[dict]:
@@ -304,7 +340,7 @@ def _chunk_segments_by_time(
     return windows
 
 
-def _group_window(client: Groq, video_title: str, segments: list[dict]) -> list[dict]:
+def _group_window(client: OpenAI, video_title: str, segments: list[dict]) -> list[dict]:
     """One LLM call grouping a single (real-time-bounded) slice of the
     transcript into topics. Used both directly (short videos, one window)
     and repeatedly by group_into_topics for long ones."""
@@ -336,12 +372,18 @@ def _group_window(client: Groq, video_title: str, segments: list[dict]) -> list[
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
             response_format={"type": "json_object"},
             temperature=0.2,
-            max_tokens=1500,
+            max_tokens=2000,
+            # gpt-oss-120b is a reasoning model — its hidden chain-of-thought
+            # eats into the same max_tokens budget as the final answer.
+            # "low" leaves enough room for the JSON reply on a task this
+            # simple (default "medium" burned ~800 reasoning tokens per
+            # window in testing, sometimes truncating the answer entirely).
+            reasoning_effort="low",
         )
 
     try:
-        resp = _call_groq_with_retry(_call)
-        data = json.loads(resp.choices[0].message.content)
+        resp = _call_llm_with_retry(_call, openai.APIStatusError)
+        data = json.loads(_extract_json_content(resp))
     except PipelineError:
         raise
     except Exception as exc:
@@ -350,7 +392,7 @@ def _group_window(client: Groq, video_title: str, segments: list[dict]) -> list[
     return _dedupe_ascending(_parse_topics_response(data))
 
 
-def _collapse_duplicate_topics(client: Groq, video_title: str, topics: list[dict]) -> list[dict]:
+def _collapse_duplicate_topics(client: OpenAI, video_title: str, topics: list[dict]) -> list[dict]:
     """Final pass over the merged topic list from all windows: ask the LLM
     to collapse any topic that got split into two near-duplicate entries at
     a window boundary. Falls back to the un-collapsed (already deduped)
@@ -379,12 +421,13 @@ def _collapse_duplicate_topics(client: Groq, video_title: str, topics: list[dict
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
             response_format={"type": "json_object"},
             temperature=0.1,
-            max_tokens=4000,
+            max_tokens=5000,
+            reasoning_effort="low",
         )
 
     try:
-        resp = _call_groq_with_retry(_call)
-        data = json.loads(resp.choices[0].message.content)
+        resp = _call_llm_with_retry(_call, openai.APIStatusError)
+        data = json.loads(_extract_json_content(resp))
         collapsed = _dedupe_ascending(_parse_topics_response(data))
     except Exception as exc:
         logger.warning("Collapse pass failed (%s) — keeping un-collapsed topic list", exc)
@@ -393,21 +436,23 @@ def _collapse_duplicate_topics(client: Groq, video_title: str, topics: list[dict
     return collapsed if collapsed else topics
 
 
-def group_into_topics(video_title: str, segments: list[dict], groq_api_key: str) -> list[dict]:
-    """LLM pass: turn a flat transcript into a topic outline with timecodes.
+def group_into_topics(video_title: str, segments: list[dict], cerebras_api_key: str) -> list[dict]:
+    """LLM pass (Cerebras, gpt-oss-120b): turn a flat transcript into a topic
+    outline with timecodes.
 
     Long transcripts are split into ~15-minute (real video time) overlapping
-    windows and grouped one window at a time — llama-3.3-70b-versatile's
-    12000 TPM cap can't take a multi-hour transcript in a single request.
-    Results are merged by timecode and, if there was more than one window,
-    passed through one more LLM call to collapse any topic that got split
-    across a window boundary.
+    windows and grouped one window at a time — both to keep each request's
+    token count reasonable and to respect Cerebras's free-tier 5 requests/
+    minute cap (the actual binding constraint here, well before its
+    1,000,000 tokens/day budget). Results are merged by timecode and, if
+    there was more than one window, passed through one more LLM call to
+    collapse any topic that got split across a window boundary.
 
     Returns a list of {"title": str, "start_seconds": int}, strictly
     ascending by start_seconds, each start_seconds grounded in an actual
     segment start (the model is instructed to copy one, not invent one).
     """
-    client = get_groq_client(groq_api_key)
+    client = get_cerebras_client(cerebras_api_key)
     windows = _chunk_segments_by_time(segments, GROUP_WINDOW_SECONDS, GROUP_WINDOW_OVERLAP_SECONDS)
     if not windows:
         raise PipelineError("транскрипт пуст — нечего группировать")
@@ -416,10 +461,11 @@ def group_into_topics(video_title: str, segments: list[dict], groq_api_key: str)
     for i, window_segments in enumerate(windows):
         all_topics.extend(_group_window(client, video_title, window_segments))
         if i < len(windows) - 1:
-            time.sleep(GROUP_WINDOW_DELAY_SECONDS)
+            time.sleep(CEREBRAS_REQUEST_DELAY_SECONDS)
 
     merged = _dedupe_ascending(all_topics)
     if len(windows) > 1 and len(merged) > 1:
+        time.sleep(CEREBRAS_REQUEST_DELAY_SECONDS)
         merged = _dedupe_ascending(_collapse_duplicate_topics(client, video_title, merged))
 
     if not merged:
