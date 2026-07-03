@@ -471,3 +471,85 @@ def group_into_topics(video_title: str, segments: list[dict], cerebras_api_key: 
     if not merged:
         raise PipelineError("LLM не вернул ни одной темы")
     return merged
+
+
+# Reasoning tokens eat into the same max_tokens budget as the JSON answer
+# (see _extract_json_content) — a large draft like a 100+-topic live
+# roadmap transcript needs enough headroom to echo the *entire* list back,
+# not just the edited entries, so this is higher than _group_window's 2000.
+EDIT_TOPICS_MAX_TOKENS = 8000
+
+
+def edit_topics_via_instruction(
+    video_title: str, topics: list[dict], instruction: str, cerebras_api_key: str
+) -> dict:
+    """One LLM call (Cerebras, gpt-oss-120b): apply a natural-language
+    editing instruction to an existing topic list — merge, split, rename,
+    delete, retime, or reorder. This is the "edit via chat" flow (Этап 2.1),
+    distinct from group_into_topics's initial transcript -> topics pass:
+    it only ever sees the topic list (titles + timecodes), never the
+    transcript, so it can't ground a new/split topic's start_seconds in an
+    actual transcript segment the way group_into_topics does.
+
+    `topics` and the returned list are both 1-indexed in the prompt text
+    (not in the data itself) to match how the admin sees them numbered in
+    Telegram (see _begin_edit_session in bot.py) — the admin's instruction
+    ("тема 3", "объедини 5 и 6") only resolves to the right item if both
+    sides agree on the same numbering.
+
+    Returns {"topics": [{"title": str, "start_seconds": int}, ...], "summary": str}.
+    Raises PipelineError if the LLM's response is malformed or the
+    resulting topic list would be empty — callers must not save either.
+    """
+    client = get_cerebras_client(cerebras_api_key)
+    listing = "\n".join(f"{i + 1}. [{t['start_seconds']}s] {t['title']}" for i, t in enumerate(topics))
+
+    system = (
+        "Ты — ассистент редактирования оглавления учебного видео через чат. "
+        "Админ прислал пронумерованный список тем (заголовок + таймкод начала "
+        "в секундах, темы пронумерованы с 1) и текстовую инструкцию на русском, "
+        "как его изменить. Разрешённые операции: объединить темы, разбить тему "
+        "на несколько, переименовать, удалить, изменить таймкод, поменять "
+        "порядок. У тебя нет доступа к транскрипту видео — только к этому "
+        "списку тем, поэтому при разбиении темы на несколько подбирай новые "
+        "start_seconds на глаз где-то между старым start_seconds этой темы и "
+        "следующей по порядку. Отвечай только валидным JSON."
+    )
+    user = (
+        f"Видео: «{video_title}»\n\n"
+        f"Текущий список тем:\n\n{listing}\n\n"
+        f"Инструкция администратора:\n{instruction}\n\n"
+        "Примени инструкцию и верни ИТОГОВЫЙ список тем целиком (включая те, что "
+        "не менялись), строго по возрастанию start_seconds, заголовки на русском. "
+        "Если инструкцию невозможно выполнить (например, номер темы не существует) "
+        "— верни список без изменений и объясни проблему в summary.\n\n"
+        'Ответь строго в формате JSON: {"topics": [{"title": "...", "start_seconds": 0}], '
+        '"summary": "краткое описание на русском, что именно изменилось (или почему не получилось)"}'
+    )
+
+    def _call():
+        return client.chat.completions.create(
+            model=GROUPING_MODEL,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            response_format={"type": "json_object"},
+            temperature=0.2,
+            max_tokens=EDIT_TOPICS_MAX_TOKENS,
+            reasoning_effort="low",
+        )
+
+    try:
+        resp = _call_llm_with_retry(_call, openai.APIStatusError)
+        data = json.loads(_extract_json_content(resp))
+    except PipelineError:
+        raise
+    except Exception as exc:
+        raise PipelineError(f"LLM: не удалось применить правку ({exc})") from exc
+
+    topics_out = _dedupe_ascending(_parse_topics_response(data))
+    if not topics_out:
+        raise PipelineError("LLM вернул пустой список тем — правка не применена")
+
+    summary = data.get("summary") if isinstance(data, dict) else None
+    summary = str(summary).strip()[:500] if summary else "Список тем обновлён."
+
+    return {"topics": topics_out, "summary": summary}

@@ -145,6 +145,12 @@ CREATE TABLE IF NOT EXISTS db_course_topics (
 );
 
 CREATE INDEX IF NOT EXISTS idx_db_course_topics_video_id ON db_course_topics (db_course_video_id);
+
+CREATE TABLE IF NOT EXISTS lesson_edit_sessions (
+    admin_id           BIGINT PRIMARY KEY,
+    pending_lesson_id  BIGINT NOT NULL REFERENCES pending_lessons (id) ON DELETE CASCADE,
+    started_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
 
 # How long a "Открыть в браузере" token remains valid after creation. Long
@@ -726,3 +732,29 @@ async def add_course_video_with_topics(
                 [(video["id"], i, t["title"], t["start_seconds"]) for i, t in enumerate(topics)],
             )
             return video
+
+
+# ─── Lesson edit sessions ("edit via chat", Этап 2.1) ──────────────────────
+
+
+async def start_edit_session(admin_id: int, pending_lesson_id: int) -> None:
+    """Begin (or replace) an admin's active edit-via-chat session."""
+    await _get_pool().execute(
+        """
+        INSERT INTO lesson_edit_sessions (admin_id, pending_lesson_id, started_at)
+        VALUES ($1, $2, now())
+        ON CONFLICT (admin_id) DO UPDATE SET
+            pending_lesson_id = $2,
+            started_at = now()
+        """,
+        admin_id,
+        pending_lesson_id,
+    )
+
+
+async def get_edit_session(admin_id: int) -> Optional[asyncpg.Record]:
+    return await _get_pool().fetchrow("SELECT * FROM lesson_edit_sessions WHERE admin_id = $1", admin_id)
+
+
+async def end_edit_session(admin_id: int) -> None:
+    await _get_pool().execute("DELETE FROM lesson_edit_sessions WHERE admin_id = $1", admin_id)

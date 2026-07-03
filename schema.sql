@@ -160,3 +160,16 @@ CREATE TABLE IF NOT EXISTS db_course_topics (
 );
 
 CREATE INDEX IF NOT EXISTS idx_db_course_topics_video_id ON db_course_topics (db_course_video_id);
+
+-- Active "edit via chat" session (Этап 2.1): while a row exists for an
+-- admin, their next non-YouTube-link text message is sent to the LLM as an
+-- instruction to edit pending_lesson_id's topic list, instead of being
+-- silently ignored (see text_message_router in bot.py). One row per admin —
+-- starting a new session (even for a different lesson) replaces the old
+-- one. Stored in the DB, not in-process state, so it survives a bot restart
+-- mid-conversation.
+CREATE TABLE IF NOT EXISTS lesson_edit_sessions (
+    admin_id           BIGINT PRIMARY KEY,
+    pending_lesson_id  BIGINT NOT NULL REFERENCES pending_lessons (id) ON DELETE CASCADE,
+    started_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);

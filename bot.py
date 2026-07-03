@@ -16,7 +16,14 @@ from telegram import (
     ReplyKeyboardRemove,
     Update,
 )
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 import auth
 import db
@@ -79,6 +86,22 @@ async def is_allowed(telegram_id: int) -> bool:
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
+
+    # Deep-link from the WebApp's "Черновики уроков" screen (see admin.js's
+    # openEditViaChat): tg.openTelegramLink('https://t.me/<bot>?start=edit_<id>')
+    # sends "/start edit_<id>" the same way any Telegram deep link does.
+    if ctx.args and ctx.args[0].startswith("edit_"):
+        if not await is_admin(user_id):
+            await update.message.reply_text("❌ У вас нет прав администратора.")
+            return
+        try:
+            lesson_id = int(ctx.args[0][len("edit_"):])
+        except ValueError:
+            await update.message.reply_text("❌ Некорректная ссылка редактирования.")
+            return
+        await _begin_edit_session(update.message, user_id, lesson_id)
+        return
+
     if await is_allowed(user_id):
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("📚 Мои курсы", web_app={"url": WEBAPP_URL})]])
         prefix = "администратор!" if await is_admin(user_id) else "участник!"
@@ -454,7 +477,10 @@ async def process_pending_lesson(lesson_id: int, chat_id: int, bot, url: str, ti
 
         await db.add_pending_lesson_topics(lesson_id, topics)
         await db.update_pending_lesson_status(lesson_id, "ready_for_review")
-        await bot.send_message(chat_id, f"✅ Транскрипт готов, {len(topics)} тем найдено.")
+        kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("✏️ Редактировать текстом", callback_data=f"edit_lesson:{lesson_id}")]]
+        )
+        await bot.send_message(chat_id, f"✅ Транскрипт готов, {len(topics)} тем найдено.", reply_markup=kb)
     except lesson_pipeline.PipelineError as exc:
         logger.warning("Lesson %s pipeline failed: %s", lesson_id, exc)
         await db.update_pending_lesson_status(lesson_id, "failed", error_message=str(exc)[:500])
@@ -463,6 +489,148 @@ async def process_pending_lesson(lesson_id: int, chat_id: int, bot, url: str, ti
         logger.exception("Lesson %s pipeline crashed", lesson_id)
         await db.update_pending_lesson_status(lesson_id, "failed", error_message=str(exc)[:500])
         await bot.send_message(chat_id, f"❌ Непредвиденная ошибка при обработке видео «{title}».")
+
+
+# ─── Edit via chat (Этап 2.1: text-message alternative to the WebApp editor) ──
+
+# Recognized as "end the session" regardless of trailing punctuation/case —
+# see text_message_router.
+EDIT_SESSION_STOP_WORDS = {"готово", "стоп", "хватит"}
+
+# A long draft (e.g. a 100+-topic live-webinar transcript) can't have its
+# full topic list echoed into one Telegram message (4096-char limit) without
+# risking truncation — cap what _begin_edit_session shows, while still
+# giving the LLM (in lesson_pipeline.edit_topics_via_instruction) the
+# complete list to work from.
+MAX_LISTED_TOPICS_IN_CHAT = 40
+
+
+def _format_mmss(seconds: int) -> str:
+    m, s = divmod(max(0, int(seconds)), 60)
+    return f"{m}:{s:02d}"
+
+
+def _format_topics_listing(topics) -> str:
+    shown = topics[:MAX_LISTED_TOPICS_IN_CHAT]
+    lines = [f"{i + 1}. [{_format_mmss(t['start_seconds'])}] {t['title']}" for i, t in enumerate(shown)]
+    if len(topics) > MAX_LISTED_TOPICS_IN_CHAT:
+        lines.append(f"… и ещё {len(topics) - MAX_LISTED_TOPICS_IN_CHAT} тем (полный список — в WebApp-редакторе).")
+    return "\n".join(lines)
+
+
+async def _begin_edit_session(message, user_id: int, lesson_id: int) -> None:
+    """Shared by the inline-button callback and the /start deep link: starts
+    (or replaces) `user_id`'s edit-via-chat session for `lesson_id`, or
+    explains why it can't."""
+    lesson = await db.get_pending_lesson(lesson_id)
+    if not lesson:
+        await message.reply_text("⚠️ Черновик не найден.")
+        return
+    if lesson["status"] != "ready_for_review":
+        await message.reply_text(
+            f"⚠️ Черновик сейчас в статусе «{lesson['status']}» — редактирование через чат доступно "
+            "только для черновиков, ждущих проверки (ready_for_review)."
+        )
+        return
+
+    await db.start_edit_session(user_id, lesson_id)
+    topics = await db.get_pending_lesson_topics(lesson_id)
+    listing = _format_topics_listing(topics)
+    await message.reply_text(
+        f"✏️ Режим редактирования: «{lesson['video_title'] or lesson_id}»\n\n"
+        f"Текущие темы:\n{listing}\n\n"
+        "Опишите, что изменить, например:\n"
+        "• «объедини темы 3 и 4»\n"
+        "• «удали тему 7»\n"
+        "• «переименуй тему 2 в ...»\n"
+        "• «раздели тему 5 на две»\n\n"
+        "Когда закончите — напишите «готово»."
+    )
+
+
+async def handle_edit_lesson_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    if not await is_admin(user_id):
+        return
+    try:
+        lesson_id = int(query.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        return
+    await _begin_edit_session(update.effective_message, user_id, lesson_id)
+
+
+async def _apply_edit_instruction(message, lesson_id: int, instruction: str) -> None:
+    """One turn of the edit-via-chat conversation: send `instruction` to the
+    LLM against lesson_id's current topic list, save the result if it looks
+    sane, and report back — success or failure — without ever ending the
+    session (see text_message_router for how the session itself ends)."""
+    lesson = await db.get_pending_lesson(lesson_id)
+    if not lesson:
+        await message.reply_text("⚠️ Черновик не найден — сессия редактирования завершена.")
+        return
+
+    topic_rows = await db.get_pending_lesson_topics(lesson_id)
+    topics = [{"title": t["title"], "start_seconds": t["start_seconds"]} for t in topic_rows]
+
+    status_msg = await message.reply_text("⏳ Применяю правку...")
+    try:
+        result = await asyncio.to_thread(
+            lesson_pipeline.edit_topics_via_instruction,
+            lesson["video_title"] or "",
+            topics,
+            instruction,
+            CEREBRAS_API_KEY,
+        )
+    except lesson_pipeline.PipelineError as exc:
+        await status_msg.edit_text(
+            f"❌ Не удалось применить правку: {exc}\n\nПопробуйте переформулировать инструкцию."
+        )
+        return
+    except Exception:
+        logger.exception("Edit instruction crashed for lesson %s", lesson_id)
+        await status_msg.edit_text("❌ Непредвиденная ошибка при применении правки. Попробуйте ещё раз.")
+        return
+
+    await db.replace_pending_lesson_topics(lesson_id, result["topics"])
+    await status_msg.edit_text(
+        f"✅ {result['summary']}\n\n"
+        f"Всего тем: {len(result['topics'])}. Опишите следующую правку или напишите «готово», если закончили."
+    )
+
+
+async def text_message_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Dispatches a plain text message to exactly one of: new lesson
+    ingestion (a YouTube link), an active edit-via-chat session, or nothing
+    (silently ignored — e.g. a non-admin's random message, or an admin with
+    no active session). A YouTube link always wins over an active session,
+    so starting a new lesson never requires first typing "готово"."""
+    text = update.message.text or ""
+    if YOUTUBE_URL_RE.search(text):
+        await lesson_link_handler(update, ctx)
+        return
+
+    user_id = update.effective_user.id
+    if not await is_admin(user_id):
+        return
+
+    session = await db.get_edit_session(user_id)
+    if not session:
+        return
+
+    normalized = text.strip().lower().rstrip(".!")
+    if normalized in EDIT_SESSION_STOP_WORDS:
+        await db.end_edit_session(user_id)
+        kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📚 Админ-панель", web_app={"url": WEBAPP_URL.rstrip("/") + "/admin.html"})]]
+        )
+        await update.message.reply_text(
+            "✅ Изменения сохранены. Откройте админ-панель, чтобы опубликовать.", reply_markup=kb
+        )
+        return
+
+    await _apply_edit_instruction(update.message, session["pending_lesson_id"], text)
 
 
 async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1128,7 +1296,8 @@ async def main() -> None:
     application.add_handler(CommandHandler("stats", stats_cmd))
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(MessageHandler(filters.CONTACT, contact_handler))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lesson_link_handler))
+    application.add_handler(CallbackQueryHandler(handle_edit_lesson_callback, pattern=r"^edit_lesson:\d+$"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_router))
     application.add_error_handler(error_handler)
 
     runner = web.AppRunner(build_web_app())
