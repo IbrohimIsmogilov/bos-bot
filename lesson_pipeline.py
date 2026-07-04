@@ -479,17 +479,55 @@ def group_into_topics(video_title: str, segments: list[dict], cerebras_api_key: 
 # not just the edited entries, so this is higher than _group_window's 2000.
 EDIT_TOPICS_MAX_TOKENS = 8000
 
+# gpt-oss-120b on Cerebras's free tier (what GROUPING_MODEL runs on here) caps
+# input at ~65k tokens (paid tier: ~131k) - see
+# https://inference-docs.cerebras.ai/models/openai-oss. There's no tokenizer
+# dependency in this project, so characters-per-token is a rough proxy; ~2.5
+# is a conservative floor for Russian text (Cyrillic BPE splits worse than
+# English). A long lecture (e.g. the ~3.5-hour "Дорожная карта" stream, ~2200
+# segments) can produce ~150-200k characters of raw transcript text - well
+# past budget once the system prompt, topic listing, instruction and
+# EDIT_TOPICS_MAX_TOKENS output are added - so the transcript is downsampled
+# to fit rather than the request being allowed to fail with a 413/empty reply.
+TRANSCRIPT_CHARS_PER_TOKEN_ESTIMATE = 2.5
+TRANSCRIPT_MAX_INPUT_TOKENS = 40_000
+TRANSCRIPT_MAX_CHARS = int(TRANSCRIPT_MAX_INPUT_TOKENS * TRANSCRIPT_CHARS_PER_TOKEN_ESTIMATE)
+
+
+def _fit_transcript_to_budget(lines: list[str], max_chars: int) -> tuple[list[str], bool]:
+    """If `lines` joined would exceed max_chars, uniformly downsample (keep
+    every Nth line) instead of truncating the tail - so the LLM still sees
+    text spanning the whole video instead of just its first N minutes, which
+    matters for instructions like "12 real steps" that need full coverage.
+    Returns (possibly-thinned lines, whether thinning happened)."""
+    total_chars = sum(len(line) + 1 for line in lines)
+    if total_chars <= max_chars or len(lines) <= 1:
+        return lines, False
+    step = math.ceil(total_chars / max_chars)
+    return lines[::step], True
+
 
 def edit_topics_via_instruction(
-    video_title: str, topics: list[dict], instruction: str, cerebras_api_key: str
+    video_title: str,
+    topics: list[dict],
+    instruction: str,
+    cerebras_api_key: str,
+    transcript: list[dict] | None = None,
 ) -> dict:
     """One LLM call (Cerebras, gpt-oss-120b): apply a natural-language
     editing instruction to an existing topic list — merge, split, rename,
-    delete, retime, or reorder. This is the "edit via chat" flow (Этап 2.1),
-    distinct from group_into_topics's initial transcript -> topics pass:
-    it only ever sees the topic list (titles + timecodes), never the
-    transcript, so it can't ground a new/split topic's start_seconds in an
-    actual transcript segment the way group_into_topics does.
+    delete, retime, or reorder. This is the "edit via chat" flow (Этап 2.1).
+
+    `transcript`, if given, is the raw Whisper transcript saved by
+    process_pending_lesson right after transcription (see
+    db.save_pending_lesson_transcript) — a list of {"start_seconds"/"start",
+    "text"} dicts in chronological order. Passing it lets the LLM ground its
+    edits (splitting a topic, judging where a "real" step actually starts) in
+    what was actually said instead of guessing from titles/timecodes alone,
+    which is what made instructions like "split into 12 real steps, nothing
+    extra" unreliable before. Omit it (None/empty) to fall back to the old
+    topics-only behavior, where it can't ground a new/split topic's
+    start_seconds in an actual transcript segment.
 
     `topics` and the returned list are both 1-indexed in the prompt text
     (not in the data itself) to match how the admin sees them numbered in
@@ -504,20 +542,55 @@ def edit_topics_via_instruction(
     client = get_cerebras_client(cerebras_api_key)
     listing = "\n".join(f"{i + 1}. [{t['start_seconds']}s] {t['title']}" for i, t in enumerate(topics))
 
+    transcript_section = ""
+    if transcript:
+        lines = [
+            f"[{int(seg.get('start_seconds', seg.get('start', 0)))}s] {seg['text']}" for seg in transcript
+        ]
+        fitted_lines, was_thinned = _fit_transcript_to_budget(lines, TRANSCRIPT_MAX_CHARS)
+        note = ""
+        if was_thinned:
+            logger.warning(
+                "Transcript for '%s' too large for edit_topics_via_instruction "
+                "(%d chars, %d lines) - downsampled to %d lines to fit context budget",
+                video_title, sum(len(l) for l in lines), len(lines), len(fitted_lines),
+            )
+            note = (
+                " Ниже показана лишь часть реплик, равномерно взятая по всему видео (оно слишком "
+                "длинное, чтобы влезло целиком) — ориентируйся по ним приблизительно, между "
+                "показанными репликами могла быть речь, которую ты не видишь."
+            )
+        transcript_section = (
+            "\n\nПолный транскрипт видео (таймкод и реплика) — используй его, чтобы понять, "
+            "что реально происходит в видео, а не только заголовки текущих тем."
+            + note + "\n\n" + "\n".join(fitted_lines) + "\n"
+        )
+
+    if transcript:
+        transcript_note_system = (
+            "У тебя есть доступ к транскрипту реальной речи из видео (см. ниже в сообщении) — "
+            "используй его, чтобы находить реальные смысловые границы тем и точные start_seconds, "
+            "а не только ориентироваться на текущие заголовки."
+        )
+    else:
+        transcript_note_system = (
+            "У тебя нет доступа к транскрипту видео — только к этому списку тем, поэтому при "
+            "разбиении темы на несколько подбирай новые start_seconds на глаз где-то между старым "
+            "start_seconds этой темы и следующей по порядку."
+        )
+
     system = (
         "Ты — ассистент редактирования оглавления учебного видео через чат. "
         "Админ прислал пронумерованный список тем (заголовок + таймкод начала "
         "в секундах, темы пронумерованы с 1) и текстовую инструкцию на русском, "
         "как его изменить. Разрешённые операции: объединить темы, разбить тему "
         "на несколько, переименовать, удалить, изменить таймкод, поменять "
-        "порядок. У тебя нет доступа к транскрипту видео — только к этому "
-        "списку тем, поэтому при разбиении темы на несколько подбирай новые "
-        "start_seconds на глаз где-то между старым start_seconds этой темы и "
-        "следующей по порядку. Отвечай только валидным JSON."
+        f"порядок. {transcript_note_system} Отвечай только валидным JSON."
     )
     user = (
         f"Видео: «{video_title}»\n\n"
-        f"Текущий список тем:\n\n{listing}\n\n"
+        f"Текущий список тем:\n\n{listing}\n"
+        f"{transcript_section}\n"
         f"Инструкция администратора:\n{instruction}\n\n"
         "Примени инструкцию и верни ИТОГОВЫЙ список тем целиком (включая те, что "
         "не менялись), строго по возрастанию start_seconds, заголовки на русском. "

@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import binascii
 import copy
 import datetime
 import json
@@ -472,6 +474,11 @@ async def process_pending_lesson(lesson_id: int, chat_id: int, bot, url: str, ti
         await db.update_pending_lesson_status(lesson_id, "transcribing")
         segments = await asyncio.to_thread(lesson_pipeline.download_and_transcribe, url, GROQ_API_KEY)
 
+        # Saved before grouping so the raw transcript survives past this one-shot
+        # LLM pass — see edit_topics_via_instruction, which uses it to ground
+        # later "edit via chat" instructions in the actual speech.
+        await db.save_pending_lesson_transcript(lesson_id, segments)
+
         await db.update_pending_lesson_status(lesson_id, "grouping")
         topics = await asyncio.to_thread(lesson_pipeline.group_into_topics, title, segments, CEREBRAS_API_KEY)
 
@@ -574,6 +581,9 @@ async def _apply_edit_instruction(message, lesson_id: int, instruction: str) -> 
     topic_rows = await db.get_pending_lesson_topics(lesson_id)
     topics = [{"title": t["title"], "start_seconds": t["start_seconds"]} for t in topic_rows]
 
+    transcript_rows = await db.get_pending_lesson_transcript(lesson_id)
+    transcript = [{"start_seconds": r["start_seconds"], "text": r["text"]} for r in transcript_rows]
+
     status_msg = await message.reply_text("⏳ Применяю правку...")
     try:
         result = await asyncio.to_thread(
@@ -582,6 +592,7 @@ async def _apply_edit_instruction(message, lesson_id: int, instruction: str) -> 
             topics,
             instruction,
             CEREBRAS_API_KEY,
+            transcript,
         )
     except lesson_pipeline.PipelineError as exc:
         await status_msg.edit_text(
@@ -1184,6 +1195,37 @@ def _slugify(title: str) -> str:
     return _SLUG_STRIP_RE.sub("-", translit).strip("-")[:60]
 
 
+# Cap on an admin-uploaded course icon (see POST .../publish's icon_data_url,
+# mode="new_course") after base64-decoding — keeps a single icon from
+# ballooning courses.icon while comfortably fitting a small square PNG/JPG.
+ICON_DATA_URL_MAX_DECODED_BYTES = 500 * 1024
+_ICON_DATA_URL_RE = re.compile(r"^data:image/[a-zA-Z0-9.+-]+;base64,")
+
+
+def _validate_icon_data_url(icon_data_url: object) -> Optional[str]:
+    """Validate an admin-uploaded course icon before it's stored as-is in
+    courses.icon. Returns None if icon_data_url wasn't provided at all (the
+    caller then falls back to the default emoji icon, same as before this
+    field existed — see courseIconHtml in main.js/admin.js). Raises
+    HTTPBadRequest if it was provided but isn't a plausible data:image/...
+    URL or decodes to more than ICON_DATA_URL_MAX_DECODED_BYTES."""
+    if icon_data_url is None:
+        return None
+    if not isinstance(icon_data_url, str) or not _ICON_DATA_URL_RE.match(icon_data_url):
+        raise web.HTTPBadRequest(reason="icon_data_url must be a data:image/...;base64,... URL")
+
+    b64_payload = icon_data_url.split(",", 1)[1]
+    try:
+        decoded_size = len(base64.b64decode(b64_payload, validate=True))
+    except (ValueError, binascii.Error) as exc:
+        raise web.HTTPBadRequest(reason="icon_data_url is not valid base64") from exc
+    if decoded_size > ICON_DATA_URL_MAX_DECODED_BYTES:
+        raise web.HTTPBadRequest(
+            reason=f"icon too large ({decoded_size} bytes decoded, max {ICON_DATA_URL_MAX_DECODED_BYTES})"
+        )
+    return icon_data_url
+
+
 async def handle_admin_publish_pending_lesson(request: web.Request) -> web.Response:
     admin_user = await _authenticate(request)
     await _require_admin(admin_user["id"])
@@ -1215,6 +1257,7 @@ async def handle_admin_publish_pending_lesson(request: web.Request) -> web.Respo
         title = title.strip()
         subtitle = payload.get("subtitle")
         subtitle = subtitle.strip() if isinstance(subtitle, str) and subtitle.strip() else None
+        icon = _validate_icon_data_url(payload.get("icon_data_url"))
 
         explicit_course_id = payload.get("course_id")
         if isinstance(explicit_course_id, str) and explicit_course_id.strip():
@@ -1229,7 +1272,7 @@ async def handle_admin_publish_pending_lesson(request: web.Request) -> web.Respo
                 course_id = f"{base}-{suffix}"
                 suffix += 1
 
-        await db.create_course(course_id, title, subtitle)
+        await db.create_course(course_id, title, subtitle, icon)
         await db.add_course_video_with_topics(course_id, 0, None, lesson["video_id"], topics)
 
     elif mode == "existing_course":

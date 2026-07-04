@@ -132,6 +132,23 @@ CREATE TABLE IF NOT EXISTS pending_lesson_topics (
 
 CREATE INDEX IF NOT EXISTS idx_pending_lesson_topics_lesson_id ON pending_lesson_topics (pending_lesson_id);
 
+-- Raw Whisper transcript segments (see lesson_pipeline.download_and_transcribe),
+-- saved right after transcription succeeds (status -> 'grouping') so the full
+-- text of what was actually said survives past the one-shot LLM grouping pass
+-- that originally consumed it — edit_topics_via_instruction can then ground
+-- an "edit via chat" instruction in real speech, not just the current topic
+-- titles/timecodes.
+CREATE TABLE IF NOT EXISTS pending_lesson_transcript (
+    id                 BIGSERIAL PRIMARY KEY,
+    pending_lesson_id  BIGINT NOT NULL REFERENCES pending_lessons (id) ON DELETE CASCADE,
+    position           INTEGER NOT NULL,
+    start_seconds      NUMERIC NOT NULL,
+    text               TEXT NOT NULL,
+    UNIQUE (pending_lesson_id, position)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_lesson_transcript_lesson_id ON pending_lesson_transcript (pending_lesson_id);
+
 -- Published lesson videos for a course (Этап 2). A course can be entirely
 -- DB-backed (no entry in course_data.py's COURSES at all) or a hardcoded
 -- multi-day course (e.g. "bos") that gets extra days appended from here —

@@ -123,6 +123,17 @@ CREATE TABLE IF NOT EXISTS pending_lesson_topics (
 
 CREATE INDEX IF NOT EXISTS idx_pending_lesson_topics_lesson_id ON pending_lesson_topics (pending_lesson_id);
 
+CREATE TABLE IF NOT EXISTS pending_lesson_transcript (
+    id                 BIGSERIAL PRIMARY KEY,
+    pending_lesson_id  BIGINT NOT NULL REFERENCES pending_lessons (id) ON DELETE CASCADE,
+    position           INTEGER NOT NULL,
+    start_seconds      NUMERIC NOT NULL,
+    text               TEXT NOT NULL,
+    UNIQUE (pending_lesson_id, position)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_lesson_transcript_lesson_id ON pending_lesson_transcript (pending_lesson_id);
+
 CREATE TABLE IF NOT EXISTS db_course_videos (
     id         BIGSERIAL PRIMARY KEY,
     course_id  TEXT NOT NULL REFERENCES courses (id) ON DELETE CASCADE,
@@ -645,6 +656,30 @@ async def add_pending_lesson_topics(pending_lesson_id: int, topics: list[dict]) 
 async def get_pending_lesson_topics(pending_lesson_id: int) -> list[asyncpg.Record]:
     return await _get_pool().fetch(
         "SELECT * FROM pending_lesson_topics WHERE pending_lesson_id = $1 ORDER BY position",
+        pending_lesson_id,
+    )
+
+
+async def save_pending_lesson_transcript(pending_lesson_id: int, segments: list[dict]) -> None:
+    """Persist the raw Whisper transcript (see lesson_pipeline.download_and_transcribe)
+    so it outlives the one-shot grouping pass that originally consumed it —
+    called once, right after transcription succeeds (see process_pending_lesson
+    in bot.py). Assumes no transcript is already stored for this lesson."""
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.executemany(
+                """
+                INSERT INTO pending_lesson_transcript (pending_lesson_id, position, start_seconds, text)
+                VALUES ($1, $2, $3, $4)
+                """,
+                [(pending_lesson_id, i, seg["start"], seg["text"]) for i, seg in enumerate(segments)],
+            )
+
+
+async def get_pending_lesson_transcript(pending_lesson_id: int) -> list[asyncpg.Record]:
+    return await _get_pool().fetch(
+        "SELECT * FROM pending_lesson_transcript WHERE pending_lesson_id = $1 ORDER BY position",
         pending_lesson_id,
     )
 
