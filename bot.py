@@ -1176,6 +1176,38 @@ async def handle_admin_pending_lesson_detail(request: web.Request) -> web.Respon
     return web.json_response(result)
 
 
+def _format_transcript_timecode(seconds) -> str:
+    """"M:SS" formatting for the downloadable transcript — same convention
+    as admin.js's formatTimecode (minutes not zero-padded past 9, e.g.
+    "3:07", "198:43" for a long video)."""
+    total = max(0, int(seconds))
+    m, s = divmod(total, 60)
+    return f"{m}:{s:02d}"
+
+
+async def handle_admin_pending_lesson_transcript(request: web.Request) -> web.Response:
+    user = await _authenticate(request)
+    await _require_admin(user["id"])
+    lesson_id = _parse_lesson_id(request)
+
+    if not await db.get_pending_lesson(lesson_id):
+        raise web.HTTPNotFound(reason="unknown pending lesson")
+
+    rows = await db.get_pending_lesson_transcript(lesson_id)
+    if not rows:
+        raise web.HTTPNotFound(
+            reason="transcript not available for this lesson (it was created before transcript saving was added)"
+        )
+
+    lines = [f"[{_format_transcript_timecode(r['start_seconds'])}] {r['text']}" for r in rows]
+    return web.Response(
+        text="\n".join(lines) + "\n",
+        content_type="text/plain",
+        charset="utf-8",
+        headers={"Content-Disposition": f'attachment; filename="transcript_{lesson_id}.txt"'},
+    )
+
+
 def _validate_topics_payload(payload) -> list[dict]:
     if not isinstance(payload, list) or not payload:
         raise web.HTTPBadRequest(reason="body must be a non-empty JSON array of {title, start_seconds}")
@@ -1380,6 +1412,7 @@ def build_web_app() -> web.Application:
     app.router.add_get("/api/admin/courses", handle_admin_courses)
     app.router.add_get("/api/admin/pending-lessons", handle_admin_pending_lessons)
     app.router.add_get("/api/admin/pending-lessons/{id}", handle_admin_pending_lesson_detail)
+    app.router.add_get("/api/admin/pending-lessons/{id}/transcript", handle_admin_pending_lesson_transcript)
     app.router.add_patch("/api/admin/pending-lessons/{id}/topics", handle_admin_pending_lesson_topics)
     app.router.add_post("/api/admin/pending-lessons/{id}/delete", handle_admin_delete_pending_lesson)
     app.router.add_post("/api/admin/pending-lessons/{id}/publish", handle_admin_publish_pending_lesson)
