@@ -1185,6 +1185,48 @@ def _format_transcript_timecode(seconds) -> str:
     return f"{m}:{s:02d}"
 
 
+def _interleave_transcript_with_topic_markers(
+    transcript_rows: list[asyncpg.Record], topic_rows: list[asyncpg.Record]
+) -> list[str]:
+    """Build the downloadable transcript's lines, inserting a
+    "=== ТЕМА N: {title} [{M:SS}] ===" marker right before the first segment
+    whose timecode is >= that topic's start_seconds (i.e. the segment the
+    topic's start_seconds was grounded in — see group_into_topics/
+    edit_topics_via_instruction, which always copy an actual segment start
+    rather than inventing one). Topics are numbered 1-based in start_seconds
+    order, matching how the admin sees them numbered in the WebApp editor
+    and in Telegram's "edit via chat" flow.
+
+    A topic whose start_seconds falls after every transcript segment (e.g.
+    manually retimed past the end) still gets its marker — appended at the
+    very end, after the last segment line — so no topic is silently dropped.
+    Returns [] lines unchanged (no markers) when topic_rows is empty.
+    """
+    topics_sorted = sorted(topic_rows, key=lambda t: t["start_seconds"])
+    topic_idx = 0
+    n_topics = len(topics_sorted)
+
+    lines = []
+    for row in transcript_rows:
+        seg_start = row["start_seconds"]
+        while topic_idx < n_topics and topics_sorted[topic_idx]["start_seconds"] <= seg_start:
+            t = topics_sorted[topic_idx]
+            lines.append(
+                f"=== ТЕМА {topic_idx + 1}: {t['title']} [{_format_transcript_timecode(t['start_seconds'])}] ==="
+            )
+            topic_idx += 1
+        lines.append(f"[{_format_transcript_timecode(seg_start)}] {row['text']}")
+
+    while topic_idx < n_topics:
+        t = topics_sorted[topic_idx]
+        lines.append(
+            f"=== ТЕМА {topic_idx + 1}: {t['title']} [{_format_transcript_timecode(t['start_seconds'])}] ==="
+        )
+        topic_idx += 1
+
+    return lines
+
+
 async def handle_admin_pending_lesson_transcript(request: web.Request) -> web.Response:
     user = await _authenticate(request)
     await _require_admin(user["id"])
@@ -1199,7 +1241,8 @@ async def handle_admin_pending_lesson_transcript(request: web.Request) -> web.Re
             reason="transcript not available for this lesson (it was created before transcript saving was added)"
         )
 
-    lines = [f"[{_format_transcript_timecode(r['start_seconds'])}] {r['text']}" for r in rows]
+    topic_rows = await db.get_pending_lesson_topics(lesson_id)
+    lines = _interleave_transcript_with_topic_markers(rows, topic_rows)
     return web.Response(
         text="\n".join(lines) + "\n",
         content_type="text/plain",
