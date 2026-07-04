@@ -473,6 +473,245 @@ def group_into_topics(video_title: str, segments: list[dict], cerebras_api_key: 
     return merged
 
 
+def _as_ranged_segments(transcript: list[dict]) -> list[dict]:
+    """Adapt the DB-stored transcript shape ({"start_seconds", "text"} — see
+    db.save_pending_lesson_transcript/get_pending_lesson_transcript) to the
+    {"start", "end", "text"} shape _chunk_segments_by_time expects. Per-
+    segment "end" isn't stored (only "start_seconds" and "text" are), so it's
+    approximated as the next segment's start (or +5s past its own start for
+    the last one) — that's all _chunk_segments_by_time actually needs "end"
+    for: finding the transcript's last timestamp. Per-segment windowing only
+    filters on "start"."""
+    ranged = []
+    for i, seg in enumerate(transcript):
+        start = float(seg.get("start", seg.get("start_seconds", 0)))
+        if i + 1 < len(transcript):
+            nxt = transcript[i + 1]
+            end = float(nxt.get("start", nxt.get("start_seconds", start)))
+        else:
+            end = start + 5
+        ranged.append({"start": start, "end": end, "text": seg["text"]})
+    return ranged
+
+
+def _deep_edit_window(
+    client: OpenAI,
+    video_title: str,
+    instruction: str,
+    segments: list[dict],
+    context_topics: list[dict],
+) -> list[dict]:
+    """One LLM call of edit_topics_via_deep_analysis's per-window pass:
+    rebuild the topics for a single (real-time-bounded) transcript window per
+    the admin's instruction, using the existing topics that fall within this
+    window as context — not as ground truth to preserve, since the
+    instruction may merge, split, rename, or drop them entirely."""
+    transcript = "\n".join(f"[{int(seg['start'])}s] {seg['text']}" for seg in segments)
+    window_start, window_end = int(segments[0]["start"]), int(segments[-1]["end"])
+    context_listing = (
+        "\n".join(f"- [{t['start_seconds']}s] {t['title']}" for t in context_topics)
+        if context_topics else "(в этом фрагменте пока нет тем)"
+    )
+
+    system = (
+        "Ты помогаешь переработать оглавление фрагмента вебинара по инструкции администратора, "
+        "которая применяется ко всему видео целиком (а не только к этому фрагменту) — видео "
+        "разбито на последовательные фрагменты, и ты обрабатываешь один из них. "
+        "Отвечай только валидным JSON."
+    )
+    user = (
+        f"Видео: «{video_title}»\n\n"
+        f"Инструкция администратора (ко всему видео):\n{instruction}\n\n"
+        f"Фрагмент транскрипта, интервал {window_start}-{window_end} секунд видео:\n\n{transcript}\n\n"
+        f"Текущие темы, попадающие в этот интервал (для ориентира, не обязательно сохранять как "
+        f"есть):\n{context_listing}\n\n"
+        "Перестрой темы ИМЕННО в границах этого фрагмента согласно инструкции — объединяй, "
+        "разбивай, переименовывай или убирай лишнее. Не пытайся учитывать части видео за пределами "
+        "этого фрагмента: итоговый список по всем фрагментам будет объединён отдельно. Если по "
+        "инструкции в этом фрагменте не должно остаться отдельных тем (например, весь фрагмент — "
+        "не относится к делу) — верни пустой список topics. Для каждой темы дай короткий заголовок "
+        "на русском (до 80 символов) и start_seconds — целое число секунд, совпадающее с таймкодом "
+        "одного из сегментов транскрипта фрагмента выше (не изобретай значение). Темы должны идти "
+        "строго по возрастанию start_seconds.\n\n"
+        'Ответь строго в формате JSON: {"topics": [{"title": "...", "start_seconds": 0}]}'
+    )
+
+    def _call():
+        return client.chat.completions.create(
+            model=GROUPING_MODEL,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            response_format={"type": "json_object"},
+            temperature=0.2,
+            max_tokens=2500,
+            reasoning_effort="low",
+        )
+
+    try:
+        resp = _call_llm_with_retry(_call, openai.APIStatusError)
+        data = json.loads(_extract_json_content(resp))
+    except PipelineError:
+        raise
+    except Exception as exc:
+        raise PipelineError(
+            f"LLM: не удалось переработать фрагмент {window_start}-{window_end}с ({exc})"
+        ) from exc
+
+    return _dedupe_ascending(_parse_topics_response(data))
+
+
+def _curate_deep_analysis_result(
+    client: OpenAI, video_title: str, instruction: str, topics: list[dict]
+) -> tuple[list[dict], str | None]:
+    """Final pass over edit_topics_via_deep_analysis's per-window merged
+    topic list. Each window only ever saw its own ~15-minute slice plus the
+    instruction, with no visibility into what the other windows kept — so an
+    instruction with video-wide scope (e.g. "split into exactly 12 real
+    steps, nothing else") gets satisfied *locally* by every window, each
+    keeping whatever looks topic-worthy in its own slice. The result is a
+    much longer, more detailed list than was actually asked for (measured on
+    the real "Дорожная карта" draft: 59 -> 77 topics for a "12 steps, no
+    filler" instruction — the 12 real steps were all found within a few
+    seconds of the manually-published reference, but ~65 extra topics
+    survived alongside them).
+
+    This pass re-applies the ORIGINAL instruction against the complete
+    merged list, with full visibility this time, to filter/merge it down to
+    what was actually requested — replacing group_into_topics's narrower
+    _collapse_duplicate_topics (which only ever merges near-duplicates at
+    window boundaries, since that pass has no instruction to enforce a
+    global scope against).
+
+    Falls back to the input list unchanged (with no summary) if this call
+    fails or returns nothing usable — a best-effort polish step, not worth
+    failing the whole multi-window pass over. Returns (topics, summary) —
+    summary is None on fallback, letting the caller build its own."""
+    listing = "\n".join(f"{i + 1}. [{t['start_seconds']}s] {t['title']}" for i, t in enumerate(topics))
+    system = (
+        "Ты — финальный редактор оглавления видео, собранного по кускам транскрипта. Черновой список "
+        "тем был построен кусок за куском, каждый независимо от остальных, поэтому список может быть "
+        "куда длиннее и подробнее, чем на самом деле просил администратор (например, если он просил "
+        "оставить только определённое количество тем или убрать всё лишнее — а каждый кусок сохранил "
+        "своё, не зная, что делают другие куски). Твоя задача — просмотреть список ЦЕЛИКОМ и применить "
+        "исходную инструкцию администратора уже с полным охватом всего видео, как если бы её выполняли "
+        "за один проход. Для каждой оставшейся темы используй start_seconds одной из объединяемых/"
+        "исходных тем (более раннюю при объединении) — не изобретай новые значения. Отвечай только "
+        "валидным JSON."
+    )
+    user = (
+        f"Видео: «{video_title}»\n\n"
+        f"Исходная инструкция администратора (применялась по кускам видео, теперь применяем "
+        f"целиком):\n{instruction}\n\n"
+        f"Черновой список тем, собранный по кускам (номер, таймкод, заголовок):\n\n{listing}\n\n"
+        "Примени инструкцию к списку ЦЕЛИКОМ и верни итоговый список, строго соответствующий тому, "
+        "что просил администратор (включая нужное количество тем, если оно указано). Убери темы, не "
+        "относящиеся к сути инструкции. Заголовки — на русском. Верни список по возрастанию "
+        "start_seconds.\n\n"
+        'Ответь строго в формате JSON: {"topics": [{"title": "...", "start_seconds": 0}], '
+        '"summary": "краткое описание на русском, что получилось в итоге"}'
+    )
+
+    def _call():
+        return client.chat.completions.create(
+            model=GROUPING_MODEL,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            response_format={"type": "json_object"},
+            temperature=0.2,
+            max_tokens=EDIT_TOPICS_MAX_TOKENS,
+            reasoning_effort="low",
+        )
+
+    try:
+        resp = _call_llm_with_retry(_call, openai.APIStatusError)
+        data = json.loads(_extract_json_content(resp))
+        curated = _dedupe_ascending(_parse_topics_response(data))
+        summary = data.get("summary") if isinstance(data, dict) else None
+        summary = str(summary).strip()[:500] if summary else None
+    except Exception as exc:
+        logger.warning("Deep-analysis curation pass failed (%s) — keeping merged (uncurated) topic list", exc)
+        return topics, None
+
+    return (curated if curated else topics), summary
+
+
+def edit_topics_via_deep_analysis(
+    video_title: str,
+    topics: list[dict],
+    instruction: str,
+    full_transcript: list[dict],
+    cerebras_api_key: str,
+) -> dict:
+    """Multi-pass "deep" alternative to edit_topics_via_instruction (the
+    "глубоко:" prefix — see bot.py's _apply_edit_instruction) for
+    instructions that need the whole video rethought (e.g. "split into the
+    real N steps, no filler") rather than a light edit of the existing topic
+    list.
+
+    Uses the same windowing as group_into_topics's initial transcript ->
+    topics pass: the transcript is split into ~15-minute overlapping windows
+    (_chunk_segments_by_time), and each window gets its own LLM call
+    (_deep_edit_window) with the admin's instruction, that window's
+    transcript, and the subset of `topics` whose timecodes fall in that
+    window as context. This sidesteps edit_topics_via_instruction's
+    single-call context-budget problem entirely — each window's prompt is
+    naturally bounded to ~15 minutes of transcript rather than the whole
+    video downsampled — at the cost of several minutes of wall-clock time
+    (one LLM call per window, paced by CEREBRAS_REQUEST_DELAY_SECONDS to
+    respect Cerebras's free-tier RPM cap).
+
+    The per-window merge is then passed through _curate_deep_analysis_result
+    instead of group_into_topics's _collapse_duplicate_topics: each window
+    only sees its own slice, so an instruction with video-wide scope (e.g.
+    "exactly 12 real steps, nothing else") gets satisfied locally by every
+    window rather than globally, and the merged list ends up far longer
+    than requested. _curate_deep_analysis_result re-applies the instruction
+    against the complete list with full visibility to fix that — see its
+    own docstring for a concrete before/after measurement.
+
+    Unlike edit_topics_via_instruction's optional `transcript` param,
+    `full_transcript` here is required — windowing without it isn't
+    meaningful.
+
+    Returns {"topics": [...], "summary": str} — same shape as
+    edit_topics_via_instruction. Raises PipelineError if any window's LLM
+    call fails after retries, or the merged result is empty.
+    """
+    client = get_cerebras_client(cerebras_api_key)
+    ranged_transcript = _as_ranged_segments(full_transcript)
+    windows = _chunk_segments_by_time(ranged_transcript, GROUP_WINDOW_SECONDS, GROUP_WINDOW_OVERLAP_SECONDS)
+    if not windows:
+        raise PipelineError("транскрипт пуст — нечего анализировать")
+
+    all_topics: list[dict] = []
+    for i, window_segments in enumerate(windows):
+        window_start = int(window_segments[0]["start"])
+        window_end = int(window_segments[-1]["end"])
+        context_topics = [t for t in topics if window_start <= t["start_seconds"] <= window_end]
+        all_topics.extend(
+            _deep_edit_window(client, video_title, instruction, window_segments, context_topics)
+        )
+        if i < len(windows) - 1:
+            time.sleep(CEREBRAS_REQUEST_DELAY_SECONDS)
+
+    merged = _dedupe_ascending(all_topics)
+    pre_curation_count = len(merged)
+
+    curated_summary = None
+    if len(merged) > 1:
+        time.sleep(CEREBRAS_REQUEST_DELAY_SECONDS)
+        merged, curated_summary = _curate_deep_analysis_result(client, video_title, instruction, merged)
+        merged = _dedupe_ascending(merged)
+
+    if not merged:
+        raise PipelineError("глубокий анализ не вернул ни одной темы")
+
+    summary = curated_summary or (
+        f"Глубокий анализ по инструкции «{instruction}» завершён: обработано {len(windows)} "
+        f"фрагментов видео, итоговых тем — {len(merged)} (было {len(topics)}, "
+        f"после сборки по кускам — {pre_curation_count})."
+    )
+    return {"topics": merged, "summary": summary}
+
+
 # Reasoning tokens eat into the same max_tokens budget as the JSON answer
 # (see _extract_json_content) — a large draft like a 100+-topic live
 # roadmap transcript needs enough headroom to echo the *entire* list back,

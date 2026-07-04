@@ -504,6 +504,14 @@ async def process_pending_lesson(lesson_id: int, chat_id: int, bot, url: str, ti
 # see text_message_router.
 EDIT_SESSION_STOP_WORDS = {"готово", "стоп", "хватит"}
 
+# An instruction starting with this (case-insensitive) routes to
+# lesson_pipeline.edit_topics_via_deep_analysis instead of the default
+# edit_topics_via_instruction — see _apply_edit_instruction. Multi-pass and
+# several minutes slower, but rebuilds topics window-by-window from the full
+# transcript instead of a single downsampled-transcript call, for
+# instructions that need the whole video rethought rather than a light edit.
+DEEP_EDIT_PREFIX = "глубоко:"
+
 # A long draft (e.g. a 100+-topic live-webinar transcript) can't have its
 # full topic list echoed into one Telegram message (4096-char limit) without
 # risking truncation — cap what _begin_edit_session shows, while still
@@ -551,6 +559,8 @@ async def _begin_edit_session(message, user_id: int, lesson_id: int) -> None:
         "• «удали тему 7»\n"
         "• «переименуй тему 2 в ...»\n"
         "• «раздели тему 5 на две»\n\n"
+        "Для сложных правок, требующих анализа всего видео, начните инструкцию со слова "
+        "«глубоко:» — это займёт больше времени (несколько минут), но даст более точный результат.\n\n"
         "Когда закончите — напишите «готово»."
     )
 
@@ -572,7 +582,11 @@ async def _apply_edit_instruction(message, lesson_id: int, instruction: str) -> 
     """One turn of the edit-via-chat conversation: send `instruction` to the
     LLM against lesson_id's current topic list, save the result if it looks
     sane, and report back — success or failure — without ever ending the
-    session (see text_message_router for how the session itself ends)."""
+    session (see text_message_router for how the session itself ends).
+
+    An instruction starting with DEEP_EDIT_PREFIX routes to the multi-pass
+    edit_topics_via_deep_analysis instead of the default single-call
+    edit_topics_via_instruction — see that function's docstring for why."""
     lesson = await db.get_pending_lesson(lesson_id)
     if not lesson:
         await message.reply_text("⚠️ Черновик не найден — сессия редактирования завершена.")
@@ -584,16 +598,42 @@ async def _apply_edit_instruction(message, lesson_id: int, instruction: str) -> 
     transcript_rows = await db.get_pending_lesson_transcript(lesson_id)
     transcript = [{"start_seconds": r["start_seconds"], "text": r["text"]} for r in transcript_rows]
 
-    status_msg = await message.reply_text("⏳ Применяю правку...")
-    try:
-        result = await asyncio.to_thread(
-            lesson_pipeline.edit_topics_via_instruction,
-            lesson["video_title"] or "",
-            topics,
-            instruction,
-            CEREBRAS_API_KEY,
-            transcript,
+    deep_mode = instruction.strip().lower().startswith(DEEP_EDIT_PREFIX)
+    if deep_mode:
+        instruction_body = instruction.strip()[len(DEEP_EDIT_PREFIX):].strip()
+        if not transcript:
+            await message.reply_text(
+                "❌ Для глубокого анализа нужен сохранённый транскрипт видео, а для этого черновика "
+                "его нет (создан до появления этой функции). Опишите правку без «глубоко:» — "
+                "обычный режим по-прежнему доступен."
+            )
+            return
+        status_msg = await message.reply_text(
+            "⏳ Провожу глубокий анализ всего видео, это займёт несколько минут..."
         )
+    else:
+        instruction_body = instruction
+        status_msg = await message.reply_text("⏳ Применяю правку...")
+
+    try:
+        if deep_mode:
+            result = await asyncio.to_thread(
+                lesson_pipeline.edit_topics_via_deep_analysis,
+                lesson["video_title"] or "",
+                topics,
+                instruction_body,
+                transcript,
+                CEREBRAS_API_KEY,
+            )
+        else:
+            result = await asyncio.to_thread(
+                lesson_pipeline.edit_topics_via_instruction,
+                lesson["video_title"] or "",
+                topics,
+                instruction_body,
+                CEREBRAS_API_KEY,
+                transcript,
+            )
     except lesson_pipeline.PipelineError as exc:
         await status_msg.edit_text(
             f"❌ Не удалось применить правку: {exc}\n\nПопробуйте переформулировать инструкцию."
