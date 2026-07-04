@@ -698,6 +698,15 @@ async def list_pending_lessons_summary() -> list[asyncpg.Record]:
     )
 
 
+async def delete_pending_lesson(pending_lesson_id: int) -> bool:
+    """Permanently delete a pending lesson draft and everything hanging off
+    it — pending_lesson_topics, pending_lesson_transcript and
+    lesson_edit_sessions all have ON DELETE CASCADE back to pending_lessons
+    (see schema.sql), so this single DELETE is enough."""
+    result = await _get_pool().execute("DELETE FROM pending_lessons WHERE id = $1", pending_lesson_id)
+    return result != "DELETE 0"
+
+
 async def replace_pending_lesson_topics(pending_lesson_id: int, topics: list[dict]) -> None:
     """Overwrite the full draft topic outline (admin's WebApp editor always
     sends the complete list back, never a partial patch — see PATCH

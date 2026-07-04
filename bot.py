@@ -1218,6 +1218,29 @@ async def handle_admin_pending_lesson_topics(request: web.Request) -> web.Respon
     return web.json_response({"ok": True})
 
 
+# Statuses where the pipeline (process_pending_lesson) is still actively
+# writing to this row — deleting out from under it would race the worker
+# and could resurrect a half-deleted draft on its next status update.
+_PENDING_LESSON_ACTIVE_STATUSES = {"processing", "transcribing", "grouping"}
+
+
+async def handle_admin_delete_pending_lesson(request: web.Request) -> web.Response:
+    admin_user = await _authenticate(request)
+    await _require_admin(admin_user["id"])
+    lesson_id = _parse_lesson_id(request)
+
+    lesson = await db.get_pending_lesson(lesson_id)
+    if not lesson:
+        raise web.HTTPNotFound(reason="unknown pending lesson")
+    if lesson["status"] in _PENDING_LESSON_ACTIVE_STATUSES:
+        raise web.HTTPBadRequest(
+            reason=f"lesson is still {lesson['status']}, wait for it to finish before deleting"
+        )
+
+    await db.delete_pending_lesson(lesson_id)
+    return web.json_response({"ok": True})
+
+
 # Cyrillic -> Latin transliteration for auto-generating a course_id slug
 # from a Russian course title (see handle_admin_publish_pending_lesson,
 # mode="new_course" without an explicit course_id).
@@ -1358,6 +1381,7 @@ def build_web_app() -> web.Application:
     app.router.add_get("/api/admin/pending-lessons", handle_admin_pending_lessons)
     app.router.add_get("/api/admin/pending-lessons/{id}", handle_admin_pending_lesson_detail)
     app.router.add_patch("/api/admin/pending-lessons/{id}/topics", handle_admin_pending_lesson_topics)
+    app.router.add_post("/api/admin/pending-lessons/{id}/delete", handle_admin_delete_pending_lesson)
     app.router.add_post("/api/admin/pending-lessons/{id}/publish", handle_admin_publish_pending_lesson)
     app.router.add_route("OPTIONS", "/{tail:.*}", lambda request: web.Response(status=204))
     return app
