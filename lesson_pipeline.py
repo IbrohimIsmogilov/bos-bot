@@ -482,15 +482,21 @@ EDIT_TOPICS_MAX_TOKENS = 8000
 # gpt-oss-120b on Cerebras's free tier (what GROUPING_MODEL runs on here) caps
 # input at ~65k tokens (paid tier: ~131k) - see
 # https://inference-docs.cerebras.ai/models/openai-oss. There's no tokenizer
-# dependency in this project, so characters-per-token is a rough proxy; ~2.5
-# is a conservative floor for Russian text (Cyrillic BPE splits worse than
-# English). A long lecture (e.g. the ~3.5-hour "Дорожная карта" stream, ~2200
-# segments) can produce ~150-200k characters of raw transcript text - well
-# past budget once the system prompt, topic listing, instruction and
-# EDIT_TOPICS_MAX_TOKENS output are added - so the transcript is downsampled
-# to fit rather than the request being allowed to fail with a 413/empty reply.
+# dependency in this project, so characters-per-token is a rough proxy.
+#
+# 40_000 (the original value here) turned out not to be conservative enough:
+# on the real ~3.5h "Дорожная карта" draft (109 topics, transcript downsampled
+# to its cap), the full prompt measured ~97.9k chars. At the assumed 2.5
+# chars/token that looked safely under the 65k cap (~39k tokens), but the
+# request got a persistent 429 with an identical ~60s Retry-After on every
+# one of 5 retries over ~5 minutes - a fixed cap being violated, not
+# transient congestion (which would be expected to clear at least once).
+# That implies the real tokenizer is less efficient for Cyrillic than 2.5
+# chars/token (plausibly ~1.5-1.8), putting the actual request at or over
+# 65k input tokens. Cut hard, with real margin against that uncertainty,
+# rather than continuing to guess at the ratio.
 TRANSCRIPT_CHARS_PER_TOKEN_ESTIMATE = 2.5
-TRANSCRIPT_MAX_INPUT_TOKENS = 40_000
+TRANSCRIPT_MAX_INPUT_TOKENS = 15_000
 TRANSCRIPT_MAX_CHARS = int(TRANSCRIPT_MAX_INPUT_TOKENS * TRANSCRIPT_CHARS_PER_TOKEN_ESTIMATE)
 
 
