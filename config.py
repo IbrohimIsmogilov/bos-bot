@@ -11,10 +11,16 @@ PORT = int(os.environ.get("PORT", "8080"))
 # ingestion pipeline (lesson_pipeline.py).
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 
-# Cerebras API key — powers the LLM topic-grouping step of the same pipeline
-# (gpt-oss-120b via Cerebras's OpenAI-compatible endpoint). Separate from
-# Groq because Cerebras's free tier gives 1,000,000 tokens/day vs. Groq's
-# 100,000, which a multi-hour transcript can exhaust in one run.
+# Mistral API key — powers the LLM topic-grouping/editing step of the same
+# pipeline (mistral-large-latest via Mistral's OpenAI-compatible endpoint;
+# see lesson_pipeline.ACTIVE_LLM_PROVIDER). Separate from Groq because
+# Mistral's free "Experiment" tier gives ~1,000,000,000 tokens/month vs.
+# Groq's 100,000/day, which a multi-hour transcript can exhaust in one run.
+MISTRAL_API_KEY = os.environ["MISTRAL_API_KEY"]
+
+# Cerebras API key — kept for easy rollback of the LLM topic-grouping/editing
+# step (see lesson_pipeline.ACTIVE_LLM_PROVIDER). Not currently used unless
+# that switch is flipped back to "cerebras".
 CEREBRAS_API_KEY = os.environ["CEREBRAS_API_KEY"]
 
 # Telegram user IDs allowed to call the /api/admin/* endpoints, as a

@@ -30,7 +30,7 @@ from telegram.ext import (
 import auth
 import db
 import lesson_pipeline
-from config import ADMIN_ID, ADMIN_USER_IDS, BOT_TOKEN, CEREBRAS_API_KEY, GROQ_API_KEY, PORT, WEBAPP_ORIGIN, WEBAPP_URL
+from config import ADMIN_ID, ADMIN_USER_IDS, BOT_TOKEN, GROQ_API_KEY, MISTRAL_API_KEY, PORT, WEBAPP_ORIGIN, WEBAPP_URL
 from course_data import COURSES
 
 # Matches a YouTube watch/shorts/short-link URL anywhere in an admin's
@@ -480,7 +480,7 @@ async def process_pending_lesson(lesson_id: int, chat_id: int, bot, url: str, ti
         await db.save_pending_lesson_transcript(lesson_id, segments)
 
         await db.update_pending_lesson_status(lesson_id, "grouping")
-        topics = await asyncio.to_thread(lesson_pipeline.group_into_topics, title, segments, CEREBRAS_API_KEY)
+        topics = await asyncio.to_thread(lesson_pipeline.group_into_topics, title, segments, MISTRAL_API_KEY)
 
         await db.add_pending_lesson_topics(lesson_id, topics)
         await db.update_pending_lesson_status(lesson_id, "ready_for_review")
@@ -623,7 +623,7 @@ async def _apply_edit_instruction(message, lesson_id: int, instruction: str) -> 
                 topics,
                 instruction_body,
                 transcript,
-                CEREBRAS_API_KEY,
+                MISTRAL_API_KEY,
             )
         else:
             result = await asyncio.to_thread(
@@ -631,7 +631,7 @@ async def _apply_edit_instruction(message, lesson_id: int, instruction: str) -> 
                 lesson["video_title"] or "",
                 topics,
                 instruction_body,
-                CEREBRAS_API_KEY,
+                MISTRAL_API_KEY,
                 transcript,
             )
     except lesson_pipeline.PipelineError as exc:

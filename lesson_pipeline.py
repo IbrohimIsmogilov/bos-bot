@@ -30,12 +30,36 @@ logger = logging.getLogger(__name__)
 CHUNK_MB = 22  # stay safely under Groq's 25 MB Whisper upload limit
 WHISPER_MODEL = "whisper-large-v3"
 
-# Topic grouping runs on Cerebras (OpenAI-compatible endpoint), not Groq —
-# its free tier gives 1,000,000 tokens/day vs. Groq's 100,000, which a
-# multi-hour transcript can burn through in a single run. Whisper
-# transcription stays on Groq (see get_groq_client/transcribe_chunk).
+# Topic grouping/editing runs on an OpenAI-compatible endpoint, not Groq —
+# Groq's free tier is only 100,000 tokens/day, which a multi-hour transcript
+# can burn through in a single run. Whisper transcription stays on Groq
+# regardless (see get_groq_client/transcribe_chunk) — it isn't affected by
+# any of this.
+#
+# ACTIVE_LLM_PROVIDER is the single switch point between the two providers
+# wired up below. Mistral is active as of 2026-07 (its free "Experiment"
+# tier gives ~1,000,000,000 tokens/month, and doesn't suffer from the
+# persistent free-tier queue congestion that made Cerebras's 429s common).
+# The Cerebras integration is kept, not deleted — flip this back to
+# "cerebras" (and pass CEREBRAS_API_KEY instead of MISTRAL_API_KEY from
+# bot.py's call sites) to roll back if Mistral's output quality turns out
+# worse in practice.
+ACTIVE_LLM_PROVIDER = "mistral"  # "mistral" or "cerebras"
+
 CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
-GROUPING_MODEL = "gpt-oss-120b"
+CEREBRAS_GROUPING_MODEL = "gpt-oss-120b"
+
+MISTRAL_BASE_URL = "https://api.mistral.ai/v1"
+# Mistral Large over Mistral Small: both support JSON mode/structured output
+# and share the same 256k-token context window, so there's no cost or
+# context-budget reason to pick Small on a free tier with a 1B token/month
+# budget — Large's stronger reasoning gives more reliable topic boundaries
+# on a long Russian transcript, which is what this workload actually needs.
+# "-latest" tracks Mistral's current Large release (Large 3 as of 2026-07)
+# instead of a pinned version we'd have to bump by hand.
+MISTRAL_GROUPING_MODEL = "mistral-large-latest"
+
+GROUPING_MODEL = MISTRAL_GROUPING_MODEL if ACTIVE_LLM_PROVIDER == "mistral" else CEREBRAS_GROUPING_MODEL
 
 # The transcript is split into windows of real video time and grouped one
 # window at a time regardless of provider, both to keep each request's
@@ -48,6 +72,28 @@ GROUP_WINDOW_OVERLAP_SECONDS = 90
 # the binding constraint. 60/5=12s is the bare minimum; pad it so per-call
 # latency/jitter can't push us over the boundary and trigger an avoidable 429.
 CEREBRAS_REQUEST_DELAY_SECONDS = 13.0
+
+# Mistral doesn't publish an exact requests/minute number for the free
+# "Experiment" tier — as of 2026-07, both docs.mistral.ai and
+# help.mistral.ai point to the account-specific Admin Console -> Limits
+# page instead of a fixed published figure. This starts more conservative
+# than Cerebras's known 5 req/min and should be tuned from the actual
+# 429/Retry-After behavior observed while testing against a real key —
+# _call_llm_with_retry already honors Retry-After, so a too-low value here
+# surfaces as a visible retry/backoff rather than a silent failure.
+MISTRAL_REQUEST_DELAY_SECONDS = 15.0
+
+LLM_REQUEST_DELAY_SECONDS = (
+    MISTRAL_REQUEST_DELAY_SECONDS if ACTIVE_LLM_PROVIDER == "mistral" else CEREBRAS_REQUEST_DELAY_SECONDS
+)
+
+# gpt-oss-120b (Cerebras) is a reasoning model whose hidden chain-of-thought
+# eats into the same max_tokens budget as the JSON answer unless capped via
+# reasoning_effort (see _extract_json_content). Mistral Large isn't a
+# reasoning model in that sense and has no equivalent parameter, so this is
+# only passed when Cerebras is the active provider — see _LLM_EXTRA_KWARGS's
+# use in every .create() call below.
+_LLM_EXTRA_KWARGS = {"reasoning_effort": "low"} if ACTIVE_LLM_PROVIDER == "cerebras" else {}
 
 LLM_MAX_RETRIES = 5
 LLM_RETRY_BASE_DELAY = 2.0  # seconds; doubles each attempt, plus jitter
@@ -76,6 +122,38 @@ def get_cerebras_client(cerebras_api_key: str) -> OpenAI:
     return OpenAI(api_key=cerebras_api_key, base_url=CEREBRAS_BASE_URL, max_retries=0, timeout=60.0)
 
 
+# Cerebras's 60s client timeout is safe because its WSE hardware serves
+# tokens unusually fast — Mistral's ordinary GPU inference is measurably
+# slower for the same max_tokens budget. Measured against the real
+# "Дорожная карта" transcript: one edit_topics_via_instruction call (8000
+# max_tokens) finished in 58.9s (right at the 60s edge), and a second,
+# otherwise-identical call exceeded it and raised a hard
+# openai.APITimeoutError (not retried — timeouts aren't 429/413, so
+# _call_llm_with_retry doesn't catch them). 180s gives real margin instead
+# of leaving this to reproduce intermittently in production.
+MISTRAL_REQUEST_TIMEOUT_SECONDS = 180.0
+
+
+def get_mistral_client(mistral_api_key: str) -> OpenAI:
+    return OpenAI(
+        api_key=mistral_api_key,
+        base_url=MISTRAL_BASE_URL,
+        max_retries=0,
+        timeout=MISTRAL_REQUEST_TIMEOUT_SECONDS,
+    )
+
+
+def get_active_llm_client(llm_api_key: str) -> OpenAI:
+    """Single dispatch point matching ACTIVE_LLM_PROVIDER above — every
+    caller in this module (group_into_topics, edit_topics_via_instruction,
+    edit_topics_via_deep_analysis) goes through this instead of picking a
+    provider-specific getter directly, so rolling back to Cerebras is just
+    flipping the one constant."""
+    if ACTIVE_LLM_PROVIDER == "mistral":
+        return get_mistral_client(llm_api_key)
+    return get_cerebras_client(llm_api_key)
+
+
 def _format_wait(seconds: float) -> str:
     seconds = int(seconds)
     h, rem = divmod(seconds, 3600)
@@ -88,8 +166,9 @@ def _format_wait(seconds: float) -> str:
 
 
 def _call_llm_with_retry(fn, status_error_cls, *, max_retries: int = LLM_MAX_RETRIES):
-    """Call an LLM SDK function (Groq or Cerebras/OpenAI — both Stainless-
-    generated clients with an identical APIStatusError shape), retrying on
+    """Call an LLM SDK function (Groq, or an OpenAI-compatible endpoint like
+    Mistral/Cerebras via the openai SDK — all Stainless-generated clients
+    with an identical APIStatusError shape), retrying on
     429 (rate limit) / 413 (payload too large) with exponential backoff —
     honoring a Retry-After header when the provider sends one. Any other
     error, or exhausting all retries, raises PipelineError so callers never
@@ -373,12 +452,13 @@ def _group_window(client: OpenAI, video_title: str, segments: list[dict]) -> lis
             response_format={"type": "json_object"},
             temperature=0.2,
             max_tokens=2000,
-            # gpt-oss-120b is a reasoning model — its hidden chain-of-thought
-            # eats into the same max_tokens budget as the final answer.
-            # "low" leaves enough room for the JSON reply on a task this
-            # simple (default "medium" burned ~800 reasoning tokens per
-            # window in testing, sometimes truncating the answer entirely).
-            reasoning_effort="low",
+            # See _LLM_EXTRA_KWARGS: only non-empty for Cerebras, where
+            # gpt-oss-120b's hidden chain-of-thought eats into the same
+            # max_tokens budget as the final answer — "low" leaves enough
+            # room for the JSON reply on a task this simple (default
+            # "medium" burned ~800 reasoning tokens per window in testing,
+            # sometimes truncating the answer entirely).
+            **_LLM_EXTRA_KWARGS,
         )
 
     try:
@@ -422,7 +502,7 @@ def _collapse_duplicate_topics(client: OpenAI, video_title: str, topics: list[di
             response_format={"type": "json_object"},
             temperature=0.1,
             max_tokens=5000,
-            reasoning_effort="low",
+            **_LLM_EXTRA_KWARGS,
         )
 
     try:
@@ -436,23 +516,24 @@ def _collapse_duplicate_topics(client: OpenAI, video_title: str, topics: list[di
     return collapsed if collapsed else topics
 
 
-def group_into_topics(video_title: str, segments: list[dict], cerebras_api_key: str) -> list[dict]:
-    """LLM pass (Cerebras, gpt-oss-120b): turn a flat transcript into a topic
-    outline with timecodes.
+def group_into_topics(video_title: str, segments: list[dict], llm_api_key: str) -> list[dict]:
+    """LLM pass (active provider per ACTIVE_LLM_PROVIDER, currently Mistral
+    Large): turn a flat transcript into a topic outline with timecodes.
 
     Long transcripts are split into ~15-minute (real video time) overlapping
     windows and grouped one window at a time — both to keep each request's
-    token count reasonable and to respect Cerebras's free-tier 5 requests/
-    minute cap (the actual binding constraint here, well before its
-    1,000,000 tokens/day budget). Results are merged by timecode and, if
-    there was more than one window, passed through one more LLM call to
-    collapse any topic that got split across a window boundary.
+    token count reasonable and to respect the active provider's requests/
+    minute cap (see LLM_REQUEST_DELAY_SECONDS; this is the actual binding
+    constraint here, well before either provider's token budget). Results
+    are merged by timecode and, if there was more than one window, passed
+    through one more LLM call to collapse any topic that got split across a
+    window boundary.
 
     Returns a list of {"title": str, "start_seconds": int}, strictly
     ascending by start_seconds, each start_seconds grounded in an actual
     segment start (the model is instructed to copy one, not invent one).
     """
-    client = get_cerebras_client(cerebras_api_key)
+    client = get_active_llm_client(llm_api_key)
     windows = _chunk_segments_by_time(segments, GROUP_WINDOW_SECONDS, GROUP_WINDOW_OVERLAP_SECONDS)
     if not windows:
         raise PipelineError("транскрипт пуст — нечего группировать")
@@ -461,11 +542,11 @@ def group_into_topics(video_title: str, segments: list[dict], cerebras_api_key: 
     for i, window_segments in enumerate(windows):
         all_topics.extend(_group_window(client, video_title, window_segments))
         if i < len(windows) - 1:
-            time.sleep(CEREBRAS_REQUEST_DELAY_SECONDS)
+            time.sleep(LLM_REQUEST_DELAY_SECONDS)
 
     merged = _dedupe_ascending(all_topics)
     if len(windows) > 1 and len(merged) > 1:
-        time.sleep(CEREBRAS_REQUEST_DELAY_SECONDS)
+        time.sleep(LLM_REQUEST_DELAY_SECONDS)
         merged = _dedupe_ascending(_collapse_duplicate_topics(client, video_title, merged))
 
     if not merged:
@@ -543,7 +624,7 @@ def _deep_edit_window(
             response_format={"type": "json_object"},
             temperature=0.2,
             max_tokens=2500,
-            reasoning_effort="low",
+            **_LLM_EXTRA_KWARGS,
         )
 
     try:
@@ -617,7 +698,7 @@ def _curate_deep_analysis_result(
             response_format={"type": "json_object"},
             temperature=0.2,
             max_tokens=EDIT_TOPICS_MAX_TOKENS,
-            reasoning_effort="low",
+            **_LLM_EXTRA_KWARGS,
         )
 
     try:
@@ -638,7 +719,7 @@ def edit_topics_via_deep_analysis(
     topics: list[dict],
     instruction: str,
     full_transcript: list[dict],
-    cerebras_api_key: str,
+    llm_api_key: str,
 ) -> dict:
     """Multi-pass "deep" alternative to edit_topics_via_instruction (the
     "глубоко:" prefix — see bot.py's _apply_edit_instruction) for
@@ -655,8 +736,8 @@ def edit_topics_via_deep_analysis(
     single-call context-budget problem entirely — each window's prompt is
     naturally bounded to ~15 minutes of transcript rather than the whole
     video downsampled — at the cost of several minutes of wall-clock time
-    (one LLM call per window, paced by CEREBRAS_REQUEST_DELAY_SECONDS to
-    respect Cerebras's free-tier RPM cap).
+    (one LLM call per window, paced by LLM_REQUEST_DELAY_SECONDS to respect
+    the active provider's free-tier RPM cap).
 
     The per-window merge is then passed through _curate_deep_analysis_result
     instead of group_into_topics's _collapse_duplicate_topics: each window
@@ -675,7 +756,7 @@ def edit_topics_via_deep_analysis(
     edit_topics_via_instruction. Raises PipelineError if any window's LLM
     call fails after retries, or the merged result is empty.
     """
-    client = get_cerebras_client(cerebras_api_key)
+    client = get_active_llm_client(llm_api_key)
     ranged_transcript = _as_ranged_segments(full_transcript)
     windows = _chunk_segments_by_time(ranged_transcript, GROUP_WINDOW_SECONDS, GROUP_WINDOW_OVERLAP_SECONDS)
     if not windows:
@@ -690,14 +771,14 @@ def edit_topics_via_deep_analysis(
             _deep_edit_window(client, video_title, instruction, window_segments, context_topics)
         )
         if i < len(windows) - 1:
-            time.sleep(CEREBRAS_REQUEST_DELAY_SECONDS)
+            time.sleep(LLM_REQUEST_DELAY_SECONDS)
 
     merged = _dedupe_ascending(all_topics)
     pre_curation_count = len(merged)
 
     curated_summary = None
     if len(merged) > 1:
-        time.sleep(CEREBRAS_REQUEST_DELAY_SECONDS)
+        time.sleep(LLM_REQUEST_DELAY_SECONDS)
         merged, curated_summary = _curate_deep_analysis_result(client, video_title, instruction, merged)
         merged = _dedupe_ascending(merged)
 
@@ -712,14 +793,17 @@ def edit_topics_via_deep_analysis(
     return {"topics": merged, "summary": summary}
 
 
-# Reasoning tokens eat into the same max_tokens budget as the JSON answer
-# (see _extract_json_content) — a large draft like a 100+-topic live
-# roadmap transcript needs enough headroom to echo the *entire* list back,
-# not just the edited entries, so this is higher than _group_window's 2000.
+# On Cerebras, reasoning tokens eat into the same max_tokens budget as the
+# JSON answer (see _extract_json_content) — a large draft like a 100+-topic
+# live roadmap transcript needs enough headroom to echo the *entire* list
+# back, not just the edited entries, so this is higher than _group_window's
+# 2000. Mistral has no such reasoning-token overhead, so this is a generous
+# ceiling rather than a tightly-reasoned budget when it's the active provider.
 EDIT_TOPICS_MAX_TOKENS = 8000
 
-# gpt-oss-120b on Cerebras's free tier (what GROUPING_MODEL runs on here) caps
-# input at ~65k tokens (paid tier: ~131k) - see
+# gpt-oss-120b on Cerebras's free tier (the model CEREBRAS_GROUPING_MODEL
+# names, not necessarily what GROUPING_MODEL resolves to now — see
+# ACTIVE_LLM_PROVIDER) caps input at ~65k tokens (paid tier: ~131k) - see
 # https://inference-docs.cerebras.ai/models/openai-oss. There's no tokenizer
 # dependency in this project, so characters-per-token is a rough proxy.
 #
@@ -734,6 +818,11 @@ EDIT_TOPICS_MAX_TOKENS = 8000
 # chars/token (plausibly ~1.5-1.8), putting the actual request at or over
 # 65k input tokens. Cut hard, with real margin against that uncertainty,
 # rather than continuing to guess at the ratio.
+#
+# This budget was sized against Cerebras's cap specifically. Mistral Large's
+# 256k-token context has plenty of headroom over it, so the cap below stays
+# unchanged (and safe) now that Mistral is the active provider — loosening
+# it to use more of Mistral's larger context is a separate, unneeded change.
 TRANSCRIPT_CHARS_PER_TOKEN_ESTIMATE = 2.5
 TRANSCRIPT_MAX_INPUT_TOKENS = 15_000
 TRANSCRIPT_MAX_CHARS = int(TRANSCRIPT_MAX_INPUT_TOKENS * TRANSCRIPT_CHARS_PER_TOKEN_ESTIMATE)
@@ -756,12 +845,13 @@ def edit_topics_via_instruction(
     video_title: str,
     topics: list[dict],
     instruction: str,
-    cerebras_api_key: str,
+    llm_api_key: str,
     transcript: list[dict] | None = None,
 ) -> dict:
-    """One LLM call (Cerebras, gpt-oss-120b): apply a natural-language
-    editing instruction to an existing topic list — merge, split, rename,
-    delete, retime, or reorder. This is the "edit via chat" flow (Этап 2.1).
+    """One LLM call (active provider per ACTIVE_LLM_PROVIDER, currently
+    Mistral Large): apply a natural-language editing instruction to an
+    existing topic list — merge, split, rename, delete, retime, or reorder.
+    This is the "edit via chat" flow (Этап 2.1).
 
     `transcript`, if given, is the raw Whisper transcript saved by
     process_pending_lesson right after transcription (see
@@ -784,7 +874,7 @@ def edit_topics_via_instruction(
     Raises PipelineError if the LLM's response is malformed or the
     resulting topic list would be empty — callers must not save either.
     """
-    client = get_cerebras_client(cerebras_api_key)
+    client = get_active_llm_client(llm_api_key)
     listing = "\n".join(f"{i + 1}. [{t['start_seconds']}s] {t['title']}" for i, t in enumerate(topics))
 
     transcript_section = ""
@@ -852,7 +942,7 @@ def edit_topics_via_instruction(
             response_format={"type": "json_object"},
             temperature=0.2,
             max_tokens=EDIT_TOPICS_MAX_TOKENS,
-            reasoning_effort="low",
+            **_LLM_EXTRA_KWARGS,
         )
 
     try:
