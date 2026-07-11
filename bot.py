@@ -843,10 +843,48 @@ async def _db_video_to_day(video: asyncpg.Record, day_id: int) -> dict:
     }
 
 
+def _module_item_to_frontend(item: dict) -> dict:
+    """One db.get_module_contents() row -> the shape main.js expects inside
+    a module's "items" list. Videos keep the same {videoHlsUrl, topics}
+    fields _db_video_to_day already uses (topics filled in separately,
+    since get_module_contents doesn't join db_course_topics); materials are
+    just their own columns renamed to a stable public shape."""
+    if item["type"] == "video":
+        return {
+            "type": "video",
+            "id": item["id"],
+            "title": item["title"] or "Видео",
+            "videoHlsUrl": item["video_id"],
+            "topics": [],  # filled in by _build_module_payload
+        }
+    return {
+        "type": item["type"],
+        "id": item["id"],
+        "title": item["title"],
+        "url": item["storage_url"],
+    }
+
+
+async def _build_module_payload(module) -> dict:
+    items = await db.get_module_contents(module["id"])
+    result = []
+    for item in items:
+        frontend_item = _module_item_to_frontend(item)
+        if frontend_item["type"] == "video":
+            topics = _topics_from_db_rows(await db.get_course_video_topics(item["id"]))
+            frontend_item["topics"] = topics
+        result.append(frontend_item)
+    return {"id": module["id"], "title": module["title"], "items": result}
+
+
 async def _build_course_payload(course_id: str, hardcoded: Optional[dict], course_row) -> dict:
     """Assemble the GET /api/course response for one course_id, per the
-    Этап 2 spec's three cases:
+    Этап 2 spec's three cases (plus the Этап 3 modules case):
 
+    0. course_id has modules (db.list_modules) -> {modules: [...]}, each
+       module's videos and materials merged into one position-ordered
+       "items" list. Takes priority over the flat cases below — a modular
+       course is never also hardcoded or flat-DB.
     1. course_id is a hardcoded multi-day course (has "days") -> DB videos
        for it are appended as extra days at the end.
     2. course_id isn't hardcoded and has exactly one DB video -> flat
@@ -860,6 +898,13 @@ async def _build_course_payload(course_id: str, hardcoded: Optional[dict], cours
     lessons onto that shape, and handle_admin_publish_pending_lesson
     rejects "existing_course" targets that would need it to.
     """
+    modules = await db.list_modules(course_id)
+    if modules:
+        return {
+            "title": course_row["title"] if course_row else None,
+            "modules": [await _build_module_payload(m) for m in modules],
+        }
+
     if hardcoded is not None and "days" in hardcoded:
         payload = copy.deepcopy(hardcoded)
         next_day_id = max((d["id"] for d in payload["days"]), default=0) + 1

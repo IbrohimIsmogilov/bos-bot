@@ -3,6 +3,7 @@
 __pycache__/
 *.pyc
 hls_output/
+course_materials/
 .fstest/
 .claude/settings.local.json
 bos-course/

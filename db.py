@@ -134,17 +134,55 @@ CREATE TABLE IF NOT EXISTS pending_lesson_transcript (
 
 CREATE INDEX IF NOT EXISTS idx_pending_lesson_transcript_lesson_id ON pending_lesson_transcript (pending_lesson_id);
 
+-- Модуль — самостоятельная сущность, объединяющая видео и материалы одного
+-- курса под общим заголовком и порядком. Курсы без модулей (bos, roadmap)
+-- не затрагиваются: у них db_course_videos.module_id остаётся NULL.
+CREATE TABLE IF NOT EXISTS modules (
+    id         BIGSERIAL PRIMARY KEY,
+    course_id  TEXT NOT NULL REFERENCES courses (id) ON DELETE CASCADE,
+    position   INTEGER NOT NULL,
+    title      TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (course_id, position)
+);
+
+CREATE INDEX IF NOT EXISTS idx_modules_course_id ON modules (course_id);
+
 CREATE TABLE IF NOT EXISTS db_course_videos (
     id         BIGSERIAL PRIMARY KEY,
     course_id  TEXT NOT NULL REFERENCES courses (id) ON DELETE CASCADE,
     position   INTEGER NOT NULL,
     title      TEXT,
     video_id   TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (course_id, position)
+    module_id  BIGINT REFERENCES modules (id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_db_course_videos_course_id ON db_course_videos (course_id);
+CREATE INDEX IF NOT EXISTS idx_db_course_videos_module_id ON db_course_videos (module_id);
+
+-- Old course_id+position uniqueness applies only to non-modular rows;
+-- modular courses get their own module-scoped uniqueness so each module can
+-- number its items 0,1,2... independently (see schema.sql for the
+-- ALTER/DROP CONSTRAINT dance that got an already-deployed DB here).
+CREATE UNIQUE INDEX IF NOT EXISTS uq_db_course_videos_course_position
+    ON db_course_videos (course_id, position) WHERE module_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_db_course_videos_module_position
+    ON db_course_videos (module_id, position) WHERE module_id IS NOT NULL;
+
+-- Не-видео материалы модуля (PDF и т.п.). Пока только 'pdf'.
+CREATE TABLE IF NOT EXISTS course_materials (
+    id          BIGSERIAL PRIMARY KEY,
+    module_id   BIGINT NOT NULL REFERENCES modules (id) ON DELETE CASCADE,
+    type        TEXT NOT NULL CHECK (type IN ('pdf')),
+    title       TEXT NOT NULL,
+    storage_url TEXT NOT NULL,
+    position    INTEGER NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (module_id, position)
+);
+
+CREATE INDEX IF NOT EXISTS idx_course_materials_module_id ON course_materials (module_id);
 
 CREATE TABLE IF NOT EXISTS db_course_topics (
     id                 BIGSERIAL PRIMARY KEY,
@@ -846,24 +884,31 @@ async def get_course_video_topics(db_course_video_id: int) -> list[asyncpg.Recor
 
 
 async def add_course_video_with_topics(
-    course_id: str, position: int, title: Optional[str], video_id: str, topics: list[dict]
+    course_id: str,
+    position: int,
+    title: Optional[str],
+    video_id: str,
+    topics: list[dict],
+    module_id: Optional[int] = None,
 ) -> asyncpg.Record:
     """Publish a reviewed lesson: one db_course_videos row plus its topic
     outline, inserted together so a course video is never left without any
-    topics if the process dies mid-way."""
+    topics if the process dies mid-way. `module_id` is optional — omitted
+    (NULL) for the existing flat, non-modular courses (bos, roadmap)."""
     pool = _get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
             video = await conn.fetchrow(
                 """
-                INSERT INTO db_course_videos (course_id, position, title, video_id)
-                VALUES ($1, $2, $3, $4)
+                INSERT INTO db_course_videos (course_id, position, title, video_id, module_id)
+                VALUES ($1, $2, $3, $4, $5)
                 RETURNING *
                 """,
                 course_id,
                 position,
                 title,
                 video_id,
+                module_id,
             )
             await conn.executemany(
                 """
@@ -873,6 +918,75 @@ async def add_course_video_with_topics(
                 [(video["id"], i, t["title"], t["start_seconds"]) for i, t in enumerate(topics)],
             )
             return video
+
+
+# ─── Course modules (Этап 3: modular courses like "atm") ───────────────────
+
+
+async def create_module(course_id: str, position: int, title: str) -> asyncpg.Record:
+    return await _get_pool().fetchrow(
+        "INSERT INTO modules (course_id, position, title) VALUES ($1, $2, $3) RETURNING *",
+        course_id,
+        position,
+        title,
+    )
+
+
+async def list_modules(course_id: str) -> list[asyncpg.Record]:
+    return await _get_pool().fetch(
+        "SELECT * FROM modules WHERE course_id = $1 ORDER BY position", course_id
+    )
+
+
+async def next_module_item_position(module_id: int) -> int:
+    """Next position for a new item (video OR material) in this module —
+    a single shared sequence across both tables so the two lists interleave
+    into one gap-free, collision-free order when merged at read time."""
+    return await _get_pool().fetchval(
+        """
+        SELECT COALESCE(MAX(pos) + 1, 0) FROM (
+            SELECT position AS pos FROM db_course_videos WHERE module_id = $1
+            UNION ALL
+            SELECT position AS pos FROM course_materials WHERE module_id = $1
+        ) combined
+        """,
+        module_id,
+    )
+
+
+async def add_course_material(
+    module_id: int, type_: str, title: str, storage_url: str, position: int
+) -> asyncpg.Record:
+    return await _get_pool().fetchrow(
+        """
+        INSERT INTO course_materials (module_id, type, title, storage_url, position)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING *
+        """,
+        module_id,
+        type_,
+        title,
+        storage_url,
+        position,
+    )
+
+
+async def get_module_contents(module_id: int) -> list[dict]:
+    """Videos and materials belonging to one module, merged into a single
+    list ordered by their shared `position` sequence (see
+    next_module_item_position) and tagged with `type` so the caller doesn't
+    need to know which table each item came from."""
+    pool = _get_pool()
+    videos = await pool.fetch(
+        "SELECT * FROM db_course_videos WHERE module_id = $1", module_id
+    )
+    materials = await pool.fetch(
+        "SELECT * FROM course_materials WHERE module_id = $1", module_id
+    )
+    items = [{"type": "video", **dict(v)} for v in videos]
+    items += [dict(row) for row in materials]  # already has its own "type" column
+    items.sort(key=lambda it: it["position"])
+    return items
 
 
 # ─── Lesson edit sessions ("edit via chat", Этап 2.1) ──────────────────────

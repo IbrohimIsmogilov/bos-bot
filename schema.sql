@@ -190,3 +190,55 @@ CREATE TABLE IF NOT EXISTS lesson_edit_sessions (
     pending_lesson_id  BIGINT NOT NULL REFERENCES pending_lessons (id) ON DELETE CASCADE,
     started_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- ─── Модули курса (Этап 3: курс "АТМ" и подобные) ──────────────────────────
+-- Модуль — самостоятельная сущность, объединяющая видео и материалы одного
+-- курса под общим заголовком и порядком. Курсы без модулей (bos, roadmap)
+-- не затрагиваются: у них db_course_videos.module_id остаётся NULL, и вся
+-- их текущая course_id+position логика не меняется.
+CREATE TABLE IF NOT EXISTS modules (
+    id         BIGSERIAL PRIMARY KEY,
+    course_id  TEXT NOT NULL REFERENCES courses (id) ON DELETE CASCADE,
+    position   INTEGER NOT NULL,
+    title      TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (course_id, position)
+);
+
+CREATE INDEX IF NOT EXISTS idx_modules_course_id ON modules (course_id);
+
+-- Привязка видео к модулю. Nullable — старые/безмодульные курсы (bos,
+-- roadmap) продолжают работать через прежнюю course_id+position схему.
+ALTER TABLE db_course_videos ADD COLUMN IF NOT EXISTS module_id BIGINT REFERENCES modules (id) ON DELETE CASCADE;
+
+CREATE INDEX IF NOT EXISTS idx_db_course_videos_module_id ON db_course_videos (module_id);
+
+-- Старый UNIQUE (course_id, position) был задан inline при создании таблицы
+-- и распространяется на ВСЕ строки, включая будущие модульные курсы с
+-- несколькими модулями — там позиции естественно должны нумероваться
+-- заново в каждом модуле (0,1,2...), а не сквозно по курсу. Разбиваем его
+-- на два частичных индекса: старое поведение — для module_id IS NULL,
+-- новое module-scoped — для module_id IS NOT NULL.
+ALTER TABLE db_course_videos DROP CONSTRAINT IF EXISTS db_course_videos_course_id_position_key;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_db_course_videos_course_position
+    ON db_course_videos (course_id, position) WHERE module_id IS NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_db_course_videos_module_position
+    ON db_course_videos (module_id, position) WHERE module_id IS NOT NULL;
+
+-- Не-видео материалы модуля (PDF и т.п.). Пока только 'pdf' — CHECK легко
+-- расширить позже (добавить 'doc'/'link'/'audio'), когда реально понадобится;
+-- сейчас лишние типы не нужны.
+CREATE TABLE IF NOT EXISTS course_materials (
+    id          BIGSERIAL PRIMARY KEY,
+    module_id   BIGINT NOT NULL REFERENCES modules (id) ON DELETE CASCADE,
+    type        TEXT NOT NULL CHECK (type IN ('pdf')),
+    title       TEXT NOT NULL,
+    storage_url TEXT NOT NULL,
+    position    INTEGER NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (module_id, position)
+);
+
+CREATE INDEX IF NOT EXISTS idx_course_materials_module_id ON course_materials (module_id);
