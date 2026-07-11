@@ -162,6 +162,29 @@ CREATE TABLE IF NOT EXISTS lesson_edit_sessions (
     pending_lesson_id  BIGINT NOT NULL REFERENCES pending_lessons (id) ON DELETE CASCADE,
     started_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Per-video resume position ("Продолжить просмотр"), keyed at topic
+-- granularity so a finished topic (completed = TRUE) drops out of the
+-- continue-watching query while the viewer's next topic becomes the new
+-- candidate. Distinct from `stats`, which is topic-segment-relative and
+-- feeds only the admin analytics screen — position_seconds here is always
+-- absolute within the underlying video, so it can be handed straight to
+-- the player's seekTo().
+CREATE TABLE IF NOT EXISTS watch_progress (
+    user_id          BIGINT NOT NULL REFERENCES users (telegram_id) ON DELETE CASCADE,
+    course_id        TEXT NOT NULL REFERENCES courses (id) ON DELETE CASCADE,
+    section_key      TEXT NOT NULL DEFAULT '',
+    section_label    TEXT NOT NULL,
+    topic_idx        INTEGER NOT NULL,
+    topic_title      TEXT NOT NULL,
+    position_seconds INTEGER NOT NULL DEFAULT 0,
+    duration_seconds INTEGER,
+    completed        BOOLEAN NOT NULL DEFAULT FALSE,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, course_id, section_key, topic_idx)
+);
+
+CREATE INDEX IF NOT EXISTS idx_watch_progress_user_updated ON watch_progress (user_id, updated_at DESC);
 """
 
 # How long a "Открыть в браузере" token remains valid after creation. Long
@@ -526,6 +549,80 @@ async def get_all_stats() -> list[asyncpg.Record]:
         JOIN users u ON u.telegram_id = s.user_id
         ORDER BY u.telegram_id, s.updated_at
         """
+    )
+
+
+# ─── Watch progress ("Продолжить просмотр") ────────────────────────────
+
+
+async def record_watch_progress(
+    user_id: int,
+    course_id: str,
+    section_key: str,
+    section_label: str,
+    topic_idx: int,
+    topic_title: str,
+    position_seconds: int,
+    duration_seconds: Optional[int],
+    completed: bool,
+) -> asyncpg.Record:
+    """Upsert the resume position for (user, course, section, topic).
+
+    Unlike stats.progress (GREATEST-only), position_seconds is overwritten
+    on every call — a user who deliberately rewinds should resume from
+    where they actually left off, not the furthest point they ever reached.
+    """
+    return await _get_pool().fetchrow(
+        """
+        INSERT INTO watch_progress (
+            user_id, course_id, section_key, section_label,
+            topic_idx, topic_title, position_seconds, duration_seconds,
+            completed, updated_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+        ON CONFLICT (user_id, course_id, section_key, topic_idx) DO UPDATE SET
+            section_label    = EXCLUDED.section_label,
+            topic_title      = EXCLUDED.topic_title,
+            position_seconds = EXCLUDED.position_seconds,
+            duration_seconds = EXCLUDED.duration_seconds,
+            completed        = EXCLUDED.completed,
+            updated_at       = now()
+        RETURNING *
+        """,
+        user_id,
+        course_id,
+        section_key,
+        section_label,
+        topic_idx,
+        topic_title,
+        position_seconds,
+        duration_seconds,
+        completed,
+    )
+
+
+async def get_continue_watching(user_id: int) -> Optional[asyncpg.Record]:
+    """The most recently updated not-yet-completed video for `user_id`,
+    across all their courses — powers the "Продолжить просмотр" card on the
+    "Мои курсы" screen. Restricted to courses the user still has access to,
+    so a revoked course never surfaces here."""
+    return await _get_pool().fetchrow(
+        """
+        SELECT wp.course_id, wp.section_key, wp.section_label, wp.topic_idx,
+               wp.topic_title, wp.position_seconds, wp.duration_seconds, wp.updated_at,
+               c.title AS course_title, c.subtitle AS course_subtitle, c.icon AS course_icon
+        FROM watch_progress wp
+        JOIN courses c ON c.id = wp.course_id
+        WHERE wp.user_id = $1
+          AND wp.completed = FALSE
+          AND EXISTS (
+              SELECT 1 FROM user_course_access uca
+              WHERE uca.user_id = wp.user_id AND uca.course_id = wp.course_id
+          )
+        ORDER BY wp.updated_at DESC
+        LIMIT 1
+        """,
+        user_id,
     )
 
 

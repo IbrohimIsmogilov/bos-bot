@@ -173,6 +173,9 @@ async def contact_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def add_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/add <phone или id> — validates and de-dupes the target up front (for
+    fast feedback), then asks which role to grant via inline buttons before
+    actually writing anything. See handle_add_role_callback for the write."""
     user_id = update.effective_user.id
     if not await is_admin(user_id):
         await update.message.reply_text("❌ У вас нет прав администратора.")
@@ -186,22 +189,77 @@ async def add_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if await db.get_allowed_phone(phone):
             await update.message.reply_text(f"⚠️ Номер {phone} уже в списке.")
             return
-        await db.add_allowed_phone(phone, is_admin=False)
-        await db.set_allowed_by_phone(phone, True)
-        await update.message.reply_text(f"✅ Добавлен номер {phone}")
+    else:
+        try:
+            tid = int(arg)
+        except ValueError:
+            await update.message.reply_text("❌ Неверный формат.")
+            return
+        existing = await db.get_user(tid)
+        if existing and existing["is_allowed"]:
+            await update.message.reply_text(f"⚠️ ID {tid} уже в списке.")
+            return
+
+    buttons = [[InlineKeyboardButton("👤 Обычный участник", callback_data=f"addrole:participant:{arg}")]]
+    # Only the super-admin can hand out admin rights (mirrors /addadmin's
+    # own ADMIN_ID-only gate) — a regular admin doesn't even see the option.
+    if user_id in ADMIN_USER_IDS:
+        buttons.append([InlineKeyboardButton("🛠 Админ", callback_data=f"addrole:admin:{arg}")])
+    buttons.append([InlineKeyboardButton("Отмена", callback_data="addrole:cancel:")])
+    await update.message.reply_text(
+        "Выберите роль для добавляемого участника:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def handle_add_role_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Second half of /add: applies the role picked via handle_add_role_callback's
+    inline buttons. Re-validates admin/super-admin rights server-side rather
+    than trusting the button that was rendered for this Telegram user."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    if not await is_admin(user_id):
         return
     try:
-        tid = int(arg)
+        _, role, arg = query.data.split(":", 2)
     except ValueError:
-        await update.message.reply_text("❌ Неверный формат.")
         return
-    existing = await db.get_user(tid)
-    if existing and existing["is_allowed"]:
-        await update.message.reply_text(f"⚠️ ID {tid} уже в списке.")
+    if role == "cancel":
+        await query.edit_message_text("Отменено.")
         return
-    await db.upsert_user(tid, is_allowed=True)
-    await db.grant_course_access(tid, DEFAULT_COURSE_ID, granted_by=user_id)
-    await update.message.reply_text(f"✅ Добавлен Telegram ID {tid}")
+
+    make_admin = role == "admin"
+    if make_admin and user_id not in ADMIN_USER_IDS:
+        await query.edit_message_text("❌ Только супер-администратор может назначать администраторов.")
+        return
+
+    if is_phone(arg):
+        phone = f"+{clean_phone(arg)}"
+        if await db.get_allowed_phone(phone):
+            await query.edit_message_text(f"⚠️ Номер {phone} уже в списке.")
+            return
+        await db.add_allowed_phone(phone, is_admin=make_admin)
+        await db.set_allowed_by_phone(phone, True)
+        if make_admin:
+            await db.set_admin_by_phone(phone, True)
+        label = f"номер {phone}"
+    else:
+        try:
+            tid = int(arg)
+        except ValueError:
+            await query.edit_message_text("❌ Неверный формат.")
+            return
+        existing = await db.get_user(tid)
+        if existing and existing["is_allowed"]:
+            await query.edit_message_text(f"⚠️ ID {tid} уже в списке.")
+            return
+        await db.upsert_user(tid, is_allowed=True, is_admin=make_admin or None)
+        await db.grant_course_access(tid, DEFAULT_COURSE_ID, granted_by=user_id)
+        label = f"Telegram ID {tid}"
+
+    role_label = "администратор" if make_admin else "участник"
+    await query.edit_message_text(f"✅ Добавлен {label} ({role_label})")
 
 
 async def remove_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -896,6 +954,67 @@ async def handle_stats(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+async def handle_watch_progress(request: web.Request) -> web.Response:
+    """Records the exact resume point (video-absolute seconds) for one
+    (course, section, topic) — see handle_continue_watching for how this
+    powers the "Продолжить просмотр" card. Separate from /api/stats: stats
+    is topic-segment-relative and feeds only the admin analytics screen."""
+    user_id = await _resolve_user_id(request)
+    if not await is_allowed(user_id):
+        raise web.HTTPForbidden(reason="access denied")
+
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        raise web.HTTPBadRequest(reason="invalid JSON body")
+
+    course_id = payload.get("course_id")
+    section_label = payload.get("section_label")
+    topic_idx = payload.get("topic_idx")
+    topic_title = payload.get("topic_title")
+    position_seconds = payload.get("position_seconds")
+    section_key = payload.get("section_key") or ""
+    duration_seconds = payload.get("duration_seconds")
+    completed = payload.get("completed", False)
+
+    if (
+        not isinstance(course_id, str)
+        or not isinstance(section_label, str)
+        or not isinstance(topic_idx, int)
+        or not isinstance(topic_title, str)
+        or not isinstance(position_seconds, (int, float))
+        or not isinstance(section_key, str)
+        or not isinstance(completed, bool)
+    ):
+        raise web.HTTPBadRequest(reason="course_id, section_label, topic_idx, topic_title and position_seconds are required")
+    if duration_seconds is not None and not isinstance(duration_seconds, (int, float)):
+        raise web.HTTPBadRequest(reason="duration_seconds must be a number if present")
+    if not course_id.strip() or not await db.get_course(course_id):
+        raise web.HTTPNotFound(reason="unknown course_id")
+
+    await db.upsert_user(user_id)
+    await db.record_watch_progress(
+        user_id,
+        course_id,
+        section_key.strip()[:200],
+        section_label.strip()[:200],
+        max(0, int(topic_idx)),
+        topic_title.strip()[:300],
+        max(0, min(int(position_seconds), 1_000_000)),
+        max(0, min(int(duration_seconds), 1_000_000)) if duration_seconds is not None else None,
+        completed,
+    )
+    return web.json_response({"ok": True})
+
+
+async def handle_continue_watching(request: web.Request) -> web.Response:
+    user_id = await _resolve_user_id(request)
+    if not await is_allowed(user_id):
+        raise web.HTTPForbidden(reason="access denied")
+    row = await db.get_continue_watching(user_id)
+    return web.json_response(_row_to_dict(row) if row else None)
+
+
 # ─── Admin API (BilimBook admin panel) ──────────────────────────────────
 
 
@@ -904,6 +1023,16 @@ async def handle_admin_users(request: web.Request) -> web.Response:
     await _require_admin(user["id"])
     rows = await db.list_all_users_with_access()
     return web.json_response([_row_to_dict(r) for r in rows])
+
+
+async def handle_admin_whoami(request: web.Request) -> web.Response:
+    """Tells the admin panel whether the caller is the super-admin (the only
+    role allowed to grant admin rights to others — see handle_admin_add_user_by_id
+    and handle_admin_add_user_by_phone) so it knows whether to show the
+    "Админ" role option in the add-user form."""
+    user = await _authenticate(request)
+    await _require_admin(user["id"])
+    return web.json_response({"is_super_admin": user["id"] in ADMIN_USER_IDS})
 
 
 async def handle_admin_grant_access(request: web.Request) -> web.Response:
@@ -944,6 +1073,21 @@ async def _validate_course_ids(course_ids) -> list:
     return course_ids
 
 
+def _validate_make_admin(payload: dict, admin_user_id: int) -> bool:
+    """Validates the optional `is_admin` field for the add-user endpoints.
+
+    Only the super-admin (ADMIN_USER_IDS) may set it True — mirrors the
+    bot's own /addadmin, which is restricted the same way — so a regular
+    admin can't hand out admin rights just because the field is client-supplied.
+    """
+    make_admin = payload.get("is_admin", False)
+    if not isinstance(make_admin, bool):
+        raise web.HTTPBadRequest(reason="is_admin must be a bool")
+    if make_admin and admin_user_id not in ADMIN_USER_IDS:
+        raise web.HTTPForbidden(reason="only the super-admin can grant admin rights")
+    return make_admin
+
+
 async def handle_admin_add_user_by_id(request: web.Request) -> web.Response:
     admin_user = await _authenticate(request)
     await _require_admin(admin_user["id"])
@@ -957,8 +1101,11 @@ async def handle_admin_add_user_by_id(request: web.Request) -> web.Response:
     if not isinstance(target_user_id, int):
         raise web.HTTPBadRequest(reason="user_id (int) is required")
     course_ids = await _validate_course_ids(payload.get("course_ids"))
+    make_admin = _validate_make_admin(payload, admin_user["id"])
 
-    await db.upsert_user(target_user_id, is_allowed=True)
+    # Only touch is_admin when actually granting it — passing False here
+    # (instead of None) would silently demote an already-existing admin.
+    await db.upsert_user(target_user_id, is_allowed=True, is_admin=make_admin or None)
     for course_id in course_ids:
         await db.grant_course_access(target_user_id, course_id, granted_by=admin_user["id"])
     return web.json_response({"ok": True})
@@ -977,10 +1124,13 @@ async def handle_admin_add_user_by_phone(request: web.Request) -> web.Response:
     if not isinstance(raw_phone, str) or not is_phone(raw_phone):
         raise web.HTTPBadRequest(reason="a valid phone_number is required")
     course_ids = await _validate_course_ids(payload.get("course_ids"))
+    make_admin = _validate_make_admin(payload, admin_user["id"])
 
     phone = f"+{clean_phone(raw_phone)}"
-    await db.add_allowed_phone(phone, is_admin=False)
+    await db.add_allowed_phone(phone, is_admin=make_admin)
     await db.set_allowed_by_phone(phone, True)
+    if make_admin:
+        await db.set_admin_by_phone(phone, True)
     for course_id in course_ids:
         await db.add_allowed_phone_course_access(phone, course_id)
 
@@ -1445,8 +1595,11 @@ def build_web_app() -> web.Application:
     app.router.add_get("/api/course", handle_course)
     app.router.add_get("/api/my-courses", handle_my_courses)
     app.router.add_post("/api/stats", handle_stats)
+    app.router.add_post("/api/watch-progress", handle_watch_progress)
+    app.router.add_get("/api/continue-watching", handle_continue_watching)
     app.router.add_post("/api/browser-token", handle_browser_token)
     app.router.add_get("/api/admin/users", handle_admin_users)
+    app.router.add_get("/api/admin/whoami", handle_admin_whoami)
     app.router.add_post("/api/admin/grant-access", handle_admin_grant_access)
     app.router.add_post("/api/admin/add-user-by-id", handle_admin_add_user_by_id)
     app.router.add_post("/api/admin/add-user-by-phone", handle_admin_add_user_by_phone)
@@ -1480,6 +1633,7 @@ async def main() -> None:
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(MessageHandler(filters.CONTACT, contact_handler))
     application.add_handler(CallbackQueryHandler(handle_edit_lesson_callback, pattern=r"^edit_lesson:\d+$"))
+    application.add_handler(CallbackQueryHandler(handle_add_role_callback, pattern=r"^addrole:"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_router))
     application.add_error_handler(error_handler)
 
