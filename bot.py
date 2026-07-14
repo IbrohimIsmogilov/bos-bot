@@ -8,6 +8,7 @@ import logging
 import re
 from typing import Optional
 
+import aiohttp
 import asyncpg
 from aiohttp import web
 from telegram import (
@@ -30,7 +31,7 @@ from telegram.ext import (
 import auth
 import db
 import lesson_pipeline
-from config import ADMIN_ID, ADMIN_USER_IDS, BOT_TOKEN, GROQ_API_KEY, MISTRAL_API_KEY, PORT, WEBAPP_ORIGIN, WEBAPP_URL
+from config import ADMIN_ID, ADMIN_USER_IDS, BOT_TOKEN, GROQ_API_KEY, MISTRAL_API_KEY, PORT, R2_PUBLIC_URL, WEBAPP_ORIGIN, WEBAPP_URL
 from course_data import COURSES
 
 # Matches a YouTube watch/shorts/short-link URL anywhere in an admin's
@@ -766,8 +767,9 @@ async def cors_middleware(request: web.Request, handler):
         except web.HTTPException as exc:
             response = exc
     response.headers["Access-Control-Allow-Origin"] = WEBAPP_ORIGIN
-    response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
+    response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, Range"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, OPTIONS"
+    response.headers["Access-Control-Expose-Headers"] = "Content-Range, Content-Length, Accept-Ranges"
     return response
 
 
@@ -1058,6 +1060,50 @@ async def handle_continue_watching(request: web.Request) -> web.Response:
         raise web.HTTPForbidden(reason="access denied")
     row = await db.get_continue_watching(user_id)
     return web.json_response(_row_to_dict(row) if row else None)
+
+
+async def handle_pdf_proxy(request: web.Request) -> web.StreamResponse:
+    """Streams a course-materials PDF from R2 through our own origin instead
+    of the browser fetching pub-*.r2.dev directly — that public dev domain
+    doesn't support CORS preflight at all, so pdf.js's Range-based fetches
+    were blocked by the browser before ever reaching R2. Range headers are
+    forwarded both ways so pdf.js's lazy per-page loading still only pulls
+    the bytes it needs, instead of the whole file on every page turn."""
+    key = request.query.get("key", "")
+    if not key.startswith("course-materials/") or ".." in key:
+        raise web.HTTPBadRequest(text="invalid key")
+
+    upstream_headers = {}
+    range_header = request.headers.get("Range")
+    if range_header:
+        upstream_headers["Range"] = range_header
+
+    session = aiohttp.ClientSession()
+    try:
+        upstream = await session.get(f"{R2_PUBLIC_URL}/{key}", headers=upstream_headers)
+    except aiohttp.ClientError:
+        await session.close()
+        raise web.HTTPBadGateway(text="upstream fetch failed")
+
+    if upstream.status >= 400:
+        await upstream.release()
+        await session.close()
+        raise web.HTTPNotFound()
+
+    resp = web.StreamResponse(status=upstream.status)
+    resp.content_type = upstream.headers.get("Content-Type", "application/pdf")
+    for h in ("Content-Range", "Content-Length", "Accept-Ranges", "ETag", "Last-Modified"):
+        if h in upstream.headers:
+            resp.headers[h] = upstream.headers[h]
+
+    await resp.prepare(request)
+    try:
+        async for chunk in upstream.content.iter_chunked(65536):
+            await resp.write(chunk)
+    finally:
+        await upstream.release()
+        await session.close()
+    return resp
 
 
 # ─── Admin API (BilimBook admin panel) ──────────────────────────────────
@@ -1642,6 +1688,7 @@ def build_web_app() -> web.Application:
     app.router.add_post("/api/stats", handle_stats)
     app.router.add_post("/api/watch-progress", handle_watch_progress)
     app.router.add_get("/api/continue-watching", handle_continue_watching)
+    app.router.add_get("/api/pdf-proxy", handle_pdf_proxy)
     app.router.add_post("/api/browser-token", handle_browser_token)
     app.router.add_get("/api/admin/users", handle_admin_users)
     app.router.add_get("/api/admin/whoami", handle_admin_whoami)

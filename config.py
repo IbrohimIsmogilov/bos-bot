@@ -7,6 +7,14 @@ WEBAPP_URL = os.environ.get("WEBAPP_URL", "https://kslmvv.github.io/bos-course/"
 DATABASE_URL = os.environ["DATABASE_URL"]
 PORT = int(os.environ.get("PORT", "8080"))
 
+# Public base URL of the Cloudflare R2 bucket (course-materials PDFs, HLS
+# video segments). Used by handle_pdf_proxy to fetch-and-stream PDFs through
+# our own origin — pub-*.r2.dev doesn't support CORS preflight (confirmed
+# against Cloudflare's docs: only custom domains bound to an R2 bucket
+# return CORS headers), so the frontend can't fetch it directly via pdf.js's
+# Range-based loading.
+R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "https://pub-633ad4e98b3c43a1a84f5168e7d6b219.r2.dev")
+
 # Groq API key — powers Whisper transcription in the automated lesson-
 # ingestion pipeline (lesson_pipeline.py).
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
