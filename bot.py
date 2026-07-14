@@ -106,8 +106,13 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if await is_allowed(user_id):
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📚 Мои курсы", web_app={"url": WEBAPP_URL})]])
-        prefix = "администратор!" if await is_admin(user_id) else "участник!"
+        admin = await is_admin(user_id)
+        # Admin-only: appends ?debug=1 so the WebApp loads Eruda (mobile
+        # console) — see index.html's debug-flag check. Regular users never
+        # get this in their button URL, only whoever opens the bot as admin.
+        webapp_url = WEBAPP_URL + ("?debug=1" if admin else "")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📚 Мои курсы", web_app={"url": webapp_url})]])
+        prefix = "администратор!" if admin else "участник!"
         await update.message.reply_text(
             f"✅ Добро пожаловать в BilimBook, {prefix}\n\nНажмите кнопку ниже, чтобы открыть ваши курсы.",
             reply_markup=kb,
