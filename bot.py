@@ -1095,6 +1095,12 @@ async def handle_pdf_proxy(request: web.Request) -> web.StreamResponse:
     for h in ("Content-Range", "Content-Length", "Accept-Ranges", "ETag", "Last-Modified"):
         if h in upstream.headers:
             resp.headers[h] = upstream.headers[h]
+    # cors_middleware sets these on the response object after the handler
+    # returns, which works for a plain web.Response (built in memory, sent
+    # once) but not here — prepare() flushes the header block to the client
+    # immediately, before the middleware ever runs. Set them ourselves.
+    resp.headers["Access-Control-Allow-Origin"] = WEBAPP_ORIGIN
+    resp.headers["Access-Control-Expose-Headers"] = "Content-Range, Content-Length, Accept-Ranges"
 
     await resp.prepare(request)
     try:
