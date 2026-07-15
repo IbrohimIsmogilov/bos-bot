@@ -6,6 +6,7 @@ import datetime
 import json
 import logging
 import re
+import time
 from typing import Optional
 
 import aiohttp
@@ -84,6 +85,16 @@ async def is_allowed(telegram_id: int) -> bool:
     return await db.is_user_allowed(telegram_id)
 
 
+def webapp_button_url() -> str:
+    """Cache-busts the WebApp URL sent in the "Мои курсы" button. Telegram's
+    in-app WebView on at least one tested device was confirmed to keep
+    reusing a stale cached index.html across /start restarts regardless of
+    the ?v= on main.js's own <script> tag — a fresh timestamp query param
+    forces it to treat every visit as a new resource. Applies to all users,
+    not just admins, since the caching behavior isn't admin-specific."""
+    return WEBAPP_URL + f"?_t={int(time.time())}"
+
+
 # ─── Telegram handlers ──────────────────────────────────────────────────
 
 
@@ -106,7 +117,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if await is_allowed(user_id):
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📚 Мои курсы", web_app={"url": WEBAPP_URL})]])
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📚 Мои курсы", web_app={"url": webapp_button_url()})]])
         prefix = "администратор!" if await is_admin(user_id) else "участник!"
         await update.message.reply_text(
             f"✅ Добро пожаловать в BilimBook, {prefix}\n\nНажмите кнопку ниже, чтобы открыть ваши курсы.",
@@ -139,7 +150,7 @@ async def contact_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     contact = update.message.contact
     user_id = update.effective_user.id
     phone = f"+{clean_phone(contact.phone_number)}"
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📚 Мои курсы", web_app={"url": WEBAPP_URL})]])
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📚 Мои курсы", web_app={"url": webapp_button_url()})]])
 
     allowed_phone = await db.get_allowed_phone(phone)
     if allowed_phone:
