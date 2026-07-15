@@ -6,7 +6,6 @@ import datetime
 import json
 import logging
 import re
-import time
 from typing import Optional
 
 import aiohttp
@@ -107,19 +106,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if await is_allowed(user_id):
-        admin = await is_admin(user_id)
-        # Admin-only: appends ?debug=1 so the WebApp loads Eruda (mobile
-        # console) — see index.html's debug-flag check. Regular users never
-        # get this in their button URL, only whoever opens the bot as admin.
-        # _t=<timestamp> makes the URL unique on every /start — Telegram's
-        # WebView caches Mini App documents more aggressively than a normal
-        # browser tab and was reusing a stale index.html across restarts
-        # even after the CDN itself had the new build (confirmed via the
-        # on-screen debug bar: WebView showed an older FRONTEND_VERSION than
-        # what GitHub Pages was actually serving at the time).
-        webapp_url = WEBAPP_URL + (f"?debug=1&_t={int(time.time())}" if admin else "")
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📚 Мои курсы", web_app={"url": webapp_url})]])
-        prefix = "администратор!" if admin else "участник!"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📚 Мои курсы", web_app={"url": WEBAPP_URL})]])
+        prefix = "администратор!" if await is_admin(user_id) else "участник!"
         await update.message.reply_text(
             f"✅ Добро пожаловать в BilimBook, {prefix}\n\nНажмите кнопку ниже, чтобы открыть ваши курсы.",
             reply_markup=kb,
@@ -1066,6 +1054,22 @@ async def handle_watch_progress(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+async def handle_client_error(request: web.Request) -> web.Response:
+    """Temporary diagnostic sink: the frontend's JS errors (currently just
+    the PDF viewer's catch blocks) get POSTed here and logged, since Eruda
+    (mobile console via CDN) turned out to be unreachable from inside
+    Telegram's WebView on this device — but this backend's own API calls
+    clearly go through fine, so errors travel over that same channel
+    instead. Logs only, nothing is persisted; delete once no longer needed."""
+    raw = await request.read()
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        payload = raw.decode("utf-8", errors="replace")
+    logger.error("CLIENT ERROR: %s", payload)
+    return web.Response(status=204)
+
+
 async def handle_continue_watching(request: web.Request) -> web.Response:
     user_id = await _resolve_user_id(request)
     if not await is_allowed(user_id):
@@ -1707,6 +1711,7 @@ def build_web_app() -> web.Application:
     app.router.add_post("/api/watch-progress", handle_watch_progress)
     app.router.add_get("/api/continue-watching", handle_continue_watching)
     app.router.add_get("/api/pdf-proxy", handle_pdf_proxy)
+    app.router.add_post("/api/client-error", handle_client_error)
     app.router.add_post("/api/browser-token", handle_browser_token)
     app.router.add_get("/api/admin/users", handle_admin_users)
     app.router.add_get("/api/admin/whoami", handle_admin_whoami)
