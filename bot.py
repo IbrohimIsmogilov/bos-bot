@@ -6,6 +6,7 @@ import datetime
 import json
 import logging
 import re
+import time
 from typing import Optional
 
 import aiohttp
@@ -110,7 +111,13 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         # Admin-only: appends ?debug=1 so the WebApp loads Eruda (mobile
         # console) — see index.html's debug-flag check. Regular users never
         # get this in their button URL, only whoever opens the bot as admin.
-        webapp_url = WEBAPP_URL + ("?debug=1" if admin else "")
+        # _t=<timestamp> makes the URL unique on every /start — Telegram's
+        # WebView caches Mini App documents more aggressively than a normal
+        # browser tab and was reusing a stale index.html across restarts
+        # even after the CDN itself had the new build (confirmed via the
+        # on-screen debug bar: WebView showed an older FRONTEND_VERSION than
+        # what GitHub Pages was actually serving at the time).
+        webapp_url = WEBAPP_URL + (f"?debug=1&_t={int(time.time())}" if admin else "")
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("📚 Мои курсы", web_app={"url": webapp_url})]])
         prefix = "администратор!" if admin else "участник!"
         await update.message.reply_text(
